@@ -99,28 +99,6 @@ namespace android_slam
         m_orb_slam = std::make_unique<::ORB_SLAM3::System>(
         vocabulary, slam_settings, static_cast<const ORB_SLAM3::System::eSensor>(desc.sensor));
 
-        pts_rel.push_back({0.0, 0.0, 0.0});
-        pts_abs.push_back({0.0, 0.0, 0.0});
-        //f304外方形走廊锚点，起点为f304外角
-        //pts_abs.push_back({9.0, 0.0, 0.0});
-        //pts_abs.push_back({38.4, 0.0, 6.0});
-        //f304外方形走廊锚点，起点为f315外角，逆时针
-        //pts_abs.push_back({9.0, 0.0, 0.0});
-        //pts_abs.push_back({42.0, 6.0, 0.0});
-        //f304锚点
-        //pts_abs.push_back({0.0, 4.0, 0.0});
-        //pts_abs.push_back({-3.0, 5.0, 0.0});
-        //f304不同起点锚点
-        //pts_abs.push_back({-18.0, 0.0, 0.0});
-        //pts_abs.push_back({-27.0, 0.0, 0.0});
-        //pts_abs.push_back({-38.4, 0.0, 6.0});
-        //根据闭环优化调整的锚点位置
-        //pts_abs.push_back({0.0, 0.0, 0.0});
-        //pts_abs.push_back({-9.0, 0.0, 0.0});
-        //pts_abs.push_back({-21.6, 0.0, 6.0});
-        //f304外方形走廊锚点，起点为f304门口，顺时针
-        pts_abs.push_back({-9.0, 0.0, 0.0});
-        pts_abs.push_back({-28.8, 0.0, 6.0});
 
     }
 
@@ -135,7 +113,7 @@ namespace android_slam
         m_orb_slam->Reset();
     }
 
-    TrackingResult SlamKernel::handleData(const std::vector<Image>& images, const std::vector<ImuPoint>& imus, const float scale)
+    TrackingResult SlamKernel::handleData(const std::vector<Image>& images, const std::vector<ImuPoint>& imus)
     {
         TrackingResult res;
 
@@ -157,15 +135,15 @@ namespace android_slam
 
 
         Eigen::Matrix4f mat_pose = pose.matrix();
-        if (CalRt && scale > 1e-6f)
+        if (m_aligned && m_sim_scale > 1e-6f)
         {
             // Tcw in SLAM world: Xc = Rcw * Xs + tcw.
-            // Output world: Xo = scale * R * Xs + t.
+            // Output world: Xo = s * R * Xs + t.
             const Eigen::Matrix3f Rcw = mat_pose.block<3, 3>(0, 0);
             const Eigen::Vector3f tcw = mat_pose.block<3, 1>(0, 3);
-            const float inv_scale = 1.0f / scale;
-            const Eigen::Matrix3f Rcw_out = inv_scale * (Rcw * R.transpose());
-            const Eigen::Vector3f tcw_out = tcw - Rcw_out * t;
+            const float inv_scale = 1.0f / m_sim_scale;
+            const Eigen::Matrix3f Rcw_out = inv_scale * (Rcw * m_R.transpose());
+            const Eigen::Vector3f tcw_out = tcw - Rcw_out * m_t;
 
             mat_pose.setIdentity();
             mat_pose.block<3, 3>(0, 0) = Rcw_out;
@@ -195,9 +173,9 @@ namespace android_slam
         {
             auto transform_point = [&](const Eigen::Vector3f& p)
             {
-                Eigen::Vector3f q = p * scale;
-                if (CalRt)
-                    q = R * q + t;
+                Eigen::Vector3f q = p;
+                if (m_aligned)
+                    q = m_sim_scale * (m_R * q) + m_t;
                 return TrackingResult::Pos{ q.x(), q.y(), q.z() };
             };
 
@@ -292,53 +270,117 @@ namespace android_slam
         return res;
     }
 
-    void SlamKernel::CalculateRt() {
-        if(pts_rel.size() == pts_abs.size()) {
-            //1. 计算质心坐标
-            cv::Point3f p1, p2;
-            int N = pts_abs.size();
-            for(int i = 0; i < N; i++) {
-                p1 += pts_abs[i];
-                p2 += pts_rel[i];
-            }
-            p1 = cv::Point3f(cv::Vec3f(p1) / N);
-            p2 = cv::Point3f(cv::Vec3f(p2) / N);
+    void SlamKernel::addSlamAnchor(float x, float y, float z)
+    {
+        m_anchor_slam.push_back(Eigen::Vector3f(x, y, z));
+    }
 
-            //2. 计算去质心坐标
-            vector<cv::Point3f> q1(N);
-            vector<cv::Point3f> q2(N);
-            for(int i = 0; i < N; i++) {
-                q1[i] = pts_abs[i] - p1;
-                q2[i] = pts_rel[i] - p2;
-            }
+    void SlamKernel::setWorldAnchors(const std::vector<Eigen::Vector3f>& anchors)
+    {
+        m_anchor_world = anchors;
+    }
 
-            //3. 计算矩阵W  q1 * q2^T
-            Eigen::Matrix3d W = Eigen::Matrix3d::Zero();
-            for(int i = 0; i < N; i++)
-                W += Eigen::Vector3d(q1[i].x, q1[i].y, q1[i].z) * Eigen::Vector3d(q2[i].x, q2[i].y, q2[i].z).transpose();
-            //cout << "W = \n" << W << endl;
+    void SlamKernel::clearAnchors()
+    {
+        m_anchor_slam.clear();
+        resetAlignment();
+    }
 
-            // 4. SVD 分解 W , 计算R
-            Eigen::JacobiSVD<Eigen::Matrix3d> svd(W, Eigen::ComputeFullU | Eigen::ComputeFullV);
-            Eigen::Matrix3d U = svd.matrixU();
-            Eigen::Matrix3d V = svd.matrixV();
-            if(U.determinant() * V.determinant() < 0) {
-                for(int x = 0; x < 3; x++)
-                    U(x, 2) *= -1;
-            }
-            R = (U*(V.transpose())).cast<float>();
+    int SlamKernel::getSlamAnchorCount() const
+    {
+        return static_cast<int>(m_anchor_slam.size());
+    }
 
-            // 5. 由旋转矩阵R, 计算平移     t_ = p - Rp
-            t = Eigen::Vector3f(p1.x, p1.y, p1.z) - R * Eigen::Vector3f(p2.x, p2.y, p2.z);
+    int SlamKernel::getWorldAnchorCount() const
+    {
+        return static_cast<int>(m_anchor_world.size());
+    }
 
-            setCalRt(true);
-            pts_rel.clear();
-            pts_rel.push_back({0.0, 0.0, 0.0});
+    void SlamKernel::resetAlignment()
+    {
+        m_aligned = false;
+        m_sim_scale = 1.0f;
+        m_R = Eigen::Matrix3f::Identity();
+        m_t = Eigen::Vector3f::Zero();
+    }
+
+    bool SlamKernel::computeAlignment()
+    {
+        const size_t n = m_anchor_slam.size();
+        if (n < 3 || n != m_anchor_world.size())
+        {
+            resetAlignment();
+            return false;
         }
-        else
-            setCalRt(false);
 
-        return;
+        // Umeyama: 求 world = s * R * slam + t 的相似变换
+        Eigen::Vector3d cs = Eigen::Vector3d::Zero();
+        Eigen::Vector3d cw = Eigen::Vector3d::Zero();
+        for (size_t i = 0; i < n; ++i)
+        {
+            cs += m_anchor_slam[i].cast<double>();
+            cw += m_anchor_world[i].cast<double>();
+        }
+        cs /= static_cast<double>(n);
+        cw /= static_cast<double>(n);
+
+        // 检查锚点在水平面(x-z)内是否近似共线：共线时无法唯一确定朝向
+        {
+            Eigen::Matrix2d cov2 = Eigen::Matrix2d::Zero();
+            for (size_t i = 0; i < n; ++i)
+            {
+                const Eigen::Vector3d a = m_anchor_slam[i].cast<double>() - cs;
+                cov2(0, 0) += a.x() * a.x();
+                cov2(0, 1) += a.x() * a.z();
+                cov2(1, 0) += a.x() * a.z();
+                cov2(1, 1) += a.z() * a.z();
+            }
+            Eigen::JacobiSVD<Eigen::Matrix2d> cov_svd(cov2);
+            const Eigen::Vector2d sv = cov_svd.singularValues();
+            if (sv(1) < 5e-2 * sv(0))
+            {
+                DEBUG_INFO("[Android Slam App Info] alignment failed: anchors nearly collinear.");
+                resetAlignment();
+                return false;
+            }
+        }
+
+        Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+        for (size_t i = 0; i < n; ++i)
+        {
+            const Eigen::Vector3d a = m_anchor_slam[i].cast<double>() - cs;
+            const Eigen::Vector3d b = m_anchor_world[i].cast<double>() - cw;
+            H += a * b.transpose();
+        }
+
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d U = svd.matrixU();
+        Eigen::Matrix3d V = svd.matrixV();
+        Eigen::Matrix3d Rd = V * U.transpose();
+        if (Rd.determinant() < 0.0)
+        {
+            V.col(2) *= -1.0;
+            Rd = V * U.transpose();
+        }
+
+        double num = 0.0;
+        double den = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const Eigen::Vector3d a = m_anchor_slam[i].cast<double>() - cs;
+            const Eigen::Vector3d b = m_anchor_world[i].cast<double>() - cw;
+            num += b.dot(Rd * a);
+            den += a.squaredNorm();
+        }
+        const double s = (den > 1e-12) ? (num / den) : 1.0;
+
+        const Eigen::Vector3d td = cw - s * Rd * cs;
+
+        m_R = Rd.cast<float>();
+        m_t = td.cast<float>();
+        m_sim_scale = static_cast<float>(s);
+        m_aligned = true;
+        return true;
     }
 
 }

@@ -67,15 +67,20 @@ namespace android_slam
         SlamKernel& operator=(const SlamKernel&) = delete;
         ~SlamKernel();
 
-        TrackingResult handleData(const std::vector<Image>& images, const std::vector<ImuPoint>& imus, const float scale);
+        TrackingResult handleData(const std::vector<Image>& images, const std::vector<ImuPoint>& imus);
 
         void reset();
 
-        void setPtsRel(float x, float y, float z) { pts_rel.push_back({x, y, z}); }
-        cv::Point3f getFirstPtsRel() { return pts_rel[0]; }
-        int getPtsRelSize() { return pts_rel.size(); }
-        void setCalRt(bool flag) { CalRt = flag; }
-        void CalculateRt();
+        // 锚点对齐：raw SLAM 坐标 <-> 真实世界坐标，Umeyama 相似变换
+        void addSlamAnchor(float x, float y, float z);
+        void setWorldAnchors(const std::vector<Eigen::Vector3f>& anchors);
+        void clearAnchors();
+        int getSlamAnchorCount() const;
+        int getWorldAnchorCount() const;
+        bool computeAlignment();
+        void resetAlignment();
+        bool isAligned() const { return m_aligned; }
+        float getSimScale() const { return m_aligned ? m_sim_scale : 1.0f; }
 
     private:
         int32_t m_width;
@@ -86,11 +91,12 @@ namespace android_slam
 
         std::chrono::steady_clock::time_point m_last_time;
 
-        std::vector<cv::Point3f> pts_abs;
-        std::vector<cv::Point3f> pts_rel;
-        Eigen::Matrix3f R;
-        Eigen::Vector3f t;
-        bool CalRt = false;
+        std::vector<Eigen::Vector3f> m_anchor_slam;
+        std::vector<Eigen::Vector3f> m_anchor_world;
+        Eigen::Matrix3f m_R = Eigen::Matrix3f::Identity();
+        Eigen::Vector3f m_t = Eigen::Vector3f::Zero();
+        float m_sim_scale = 1.0f;
+        bool m_aligned = false;
 
     };
 

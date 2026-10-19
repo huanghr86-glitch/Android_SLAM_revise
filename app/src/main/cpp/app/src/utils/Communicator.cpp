@@ -63,14 +63,14 @@ namespace android_slam
         DEBUG_INFO("[Android Slam App Info] Communicator is built.");
     }
 
-    void Communicator::Run(float x, float y, float z, std::string ip, std::string port)
+    bool Communicator::Run(float x, float y, float z, std::string ip, std::string port)
     {
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd == -1)
         {
             //std::cout << "socket 创建失败：" << std::endl;
             DEBUG_INFO("[Android Slam App Info] Socket create failed.");
-            return;
+            return false;
         }
         DEBUG_INFO("[Android Slam App Info] Socket create succesfully.");
         struct sockaddr_in addr;
@@ -85,7 +85,7 @@ namespace android_slam
         {
             DEBUG_INFO("[Comm] invalid port string: '%s'", port.c_str());
             close(socket_fd);
-            return;
+            return false;
         }
         addr.sin_port = htons(port_number);
         uint32_t parsed_ip = inet_addr(ip.c_str());
@@ -93,7 +93,7 @@ namespace android_slam
         {
             DEBUG_INFO("[Comm] invalid IP string: '%s'", ip.c_str());
             close(socket_fd);
-            return;
+            return false;
         }
         addr.sin_addr.s_addr = parsed_ip;
 
@@ -101,7 +101,7 @@ namespace android_slam
         if (res == -1)
         {
             DEBUG_INFO("[Android Slam App Info] Socket connect failed. errno=%d reason=%s", errno, strerror(errno));
-            return;
+            return false;
         }
         DEBUG_INFO("[Android Slam App Info] Socket connect successfully.");
 
@@ -111,17 +111,17 @@ namespace android_slam
         sendAll(socket_fd, commu_data, sizeof(commu_data));
         close(socket_fd);
         //usleep(100000);
-        return;
+        return true;
     }
 
-    void Communicator::Run(TrackingResult track_res, std::string ip, std::string port)
+    bool Communicator::Run(TrackingResult track_res, std::string ip, std::string port)
     {
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd == -1)
         {
             //std::cout << "socket 创建失败：" << std::endl;
             DEBUG_INFO("[Android Slam App Info] Socket create failed.");
-            return;
+            return false;
         }
         DEBUG_INFO("[Android Slam App Info] Socket create succesfully.");
         struct sockaddr_in addr;
@@ -136,7 +136,7 @@ namespace android_slam
         {
             DEBUG_INFO("[Comm] invalid port string: '%s'", port.c_str());
             close(socket_fd);
-            return;
+            return false;
         }
         addr.sin_port = htons(port_number);
         uint32_t parsed_ip = inet_addr(ip.c_str());
@@ -144,7 +144,7 @@ namespace android_slam
         {
             DEBUG_INFO("[Comm] invalid IP string: '%s'", ip.c_str());
             close(socket_fd);
-            return;
+            return false;
         }
         addr.sin_addr.s_addr = parsed_ip;
 
@@ -153,7 +153,7 @@ namespace android_slam
         if (res == -1)
         {
             DEBUG_INFO("[Android Slam App Info] Socket connect failed. errno=%d reason=%s", errno, strerror(errno));
-            return;
+            return false;
         }
         DEBUG_INFO("[Android Slam App Info] Socket connect successfully.");
 
@@ -162,7 +162,7 @@ namespace android_slam
         {
             DEBUG_INFO("[Android Slam App Info] too many trajectory points to send.");
             close(socket_fd);
-            return;
+            return false;
         }
 
         const uint32_t size = static_cast<uint32_t>(point_count) * 3u;
@@ -182,7 +182,7 @@ namespace android_slam
         DEBUG_INFO("[Android Slam App Info] sent %lu floats", (unsigned long) commu_data.size());
         close(socket_fd);
         //usleep(100000);
-        return;
+        return true;
     }
 
     void Communicator::getStartPos(std::string start_str)

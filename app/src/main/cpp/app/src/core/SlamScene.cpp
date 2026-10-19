@@ -10,6 +10,7 @@
 #include "utils/AssetManager.h"
 #include "utils/ImageLoader.h"
 #include <cstdio>
+#include <sstream>
 
 namespace android_slam
 {
@@ -59,6 +60,23 @@ namespace android_slam
             DEBUG_INFO("[Android Slam App Info] Creates slam kernel successfully.");
         }
 
+        // 读取真实世界锚点坐标（/storage/emulated/0/Documents/AnchorPos.txt，每行 x y z）
+        {
+            std::string anchor_str = AssetManager::readFile("/storage/emulated/0/Documents/AnchorPos.txt");
+            std::istringstream iss(anchor_str);
+            std::vector<Eigen::Vector3f> world_anchors;
+            float ax = 0.0f, ay = 0.0f, az = 0.0f;
+            while (iss >> ax >> ay >> az)
+                world_anchors.emplace_back(ax, ay, az);
+            if (!world_anchors.empty())
+            {
+                m_slam_kernel->setWorldAnchors(world_anchors);
+                DEBUG_INFO("[Android Slam App Info] Loaded %zu world anchors.", world_anchors.size());
+            }
+            else
+                DEBUG_INFO("[Android Slam App Info] AnchorPos.txt missing or empty.");
+        }
+
         m_slam_has_new_data = false; // Whether the main thread generates new image for slam thread.
         m_is_running_slam = true;     // Whether the slam scene is running, also indicates the slam thread is running.
 
@@ -86,7 +104,7 @@ namespace android_slam
 
                     // Call slam tracking function.
                     //auto res = m_slam_kernel->handleData(images, imu_points);
-                    auto res = m_slam_kernel->handleData(images, {}, m_scale);
+                    auto res = m_slam_kernel->handleData(images, {});
                     m_slam_has_new_data = false; // This image is processed and this thread needs new image.
 
                     // Synchronize tracking result to main thread, move the data because this thread doesn't need it.
@@ -108,6 +126,14 @@ namespace android_slam
                     [this]() {
                         std::string port = AssetManager::readFile("/storage/emulated/0/Documents/Port.txt");
                         std::string ip = AssetManager::readFile("/storage/emulated/0/Documents/IP.txt");
+                        {
+                            char comm_buf[256];
+                            snprintf(comm_buf, sizeof(comm_buf), "[comm] thread start ip='%s' port='%s'", ip.c_str(), port.c_str());
+                            DEBUG_INFO("[Android Slam App Info] %s", comm_buf);
+                            AssetManager::appendLog(comm_buf);
+                        }
+                        int send_ok = 0;
+                        int send_fail = 0;
                         //DEBUG_INFO("[Android Slam App Info] port: %s", port.c_str());
                         //DEBUG_INFO("[Android Slam App Info] ip: %s", ip.c_str());
                         while (m_is_running_slam) {
@@ -124,7 +150,26 @@ namespace android_slam
                                              tracking_res_comm.trajectory.back().z,
                                                 ip, port);
                                      */
-                                    m_comm->Run(tracking_res_comm, ip, port);
+                                    if (m_comm->Run(tracking_res_comm, ip, port))
+                                        ++send_ok;
+                                    else
+                                    {
+                                        ++send_fail;
+                                        if (send_fail == 1)
+                                        {
+                                            char comm_buf[256];
+                                            snprintf(comm_buf, sizeof(comm_buf), "[comm] first send FAILED ip='%s' port='%s'", ip.c_str(), port.c_str());
+                                            DEBUG_INFO("[Android Slam App Info] %s", comm_buf);
+                                            AssetManager::appendLog(comm_buf);
+                                        }
+                                    }
+                                    if ((send_ok + send_fail) % 200 == 0)
+                                    {
+                                        char comm_buf[256];
+                                        snprintf(comm_buf, sizeof(comm_buf), "[comm] sent=%d failed=%d", send_ok, send_fail);
+                                        DEBUG_INFO("[Android Slam App Info] %s", comm_buf);
+                                        AssetManager::appendLog(comm_buf);
+                                    }
                                 }
                                 m_comm_has_new_data = false;
                             }
@@ -202,6 +247,7 @@ namespace android_slam
             m_app_ref.m_last_process_delta_time = tracking_res.processing_delta_time;
 
             // 实验日志：打印并写入 /storage/emulated/0/Documents/SlamLog.txt
+            if (!tracking_res.tracking_status.empty())
             {
                 float px = 0.0f, py = 0.0f, pz = 0.0f;
                 if (!tracking_res.trajectory.empty())
@@ -212,11 +258,11 @@ namespace android_slam
                 }
                 char line[256];
                 snprintf(line, sizeof(line),
-                         "frame=%d state=%s dt=%.4f scale=%.4f pos=(%.4f,%.4f,%.4f) kf=%lu mp=%lu",
+                         "frame=%d state=%s dt=%.4f scale=%.4f pos=(%.4f,%.4f,%.4f) traj=%lu mp=%lu",
                          m_log_frame_index++,
                          tracking_res.tracking_status.c_str(),
                          tracking_res.processing_delta_time,
-                         m_scale,
+                         m_slam_kernel->getSimScale(),
                          px, py, pz,
                          (unsigned long) tracking_res.trajectory.size(),
                          (unsigned long) tracking_res.map_points.size());
@@ -276,60 +322,60 @@ namespace android_slam
                 m_app_ref.setActiveScene("Init");
             }
 
-            if (ImGui::Button(m_first_flag ? u8"已获取初始点" : u8"获取初始点"))
             {
-                m_first_flag = !m_first_flag;
-                if(m_slam_kernel->getPtsRelSize() == 0 && !tracking_res.trajectory.empty()) {
-                    m_slam_kernel->setPtsRel(tracking_res.trajectory.back().x,
-                                             tracking_res.trajectory.back().y,
-                                             tracking_res.trajectory.back().z);
-                }
+                const bool aligned = m_slam_kernel->isAligned();
 
-            }
-
-            if (ImGui::Button(m_scale_flag ? u8"还原尺度" : u8"获取尺度"))
-            {
-                //AssetManager::readFile();
-                m_scale_flag = !m_scale_flag;
-                if(m_scale_flag && !tracking_res.trajectory.empty()) { //到达标定位，计算尺度
-                    float x = tracking_res.trajectory.back().x;
-                    float y = tracking_res.trajectory.back().y;
-                    float z = tracking_res.trajectory.back().z;
-                    //m_scale = 9.0f / sqrt(x*x + y*y + z*z);
-                    if(m_slam_kernel->getPtsRelSize() == 1) {
-                        cv::Point3f first_pts = m_slam_kernel->getFirstPtsRel();
-                        m_scale = 9.0f / sqrt((x-first_pts.x)*(x-first_pts.x)
-                                +(y-first_pts.y)*(y-first_pts.y)
-                                +(z-first_pts.z)*(z-first_pts.z));
-                    }
-                    if(m_slam_kernel->getPtsRelSize() < 2) {
-                        m_slam_kernel->setPtsRel(x, y, z);
+                if (ImGui::Button(u8"记录锚点"))
+                {
+                    if (!tracking_res.trajectory.empty())
+                    {
+                        const auto& p = tracking_res.trajectory.back();
+                        m_slam_kernel->addSlamAnchor(p.x, p.y, p.z);
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), "anchor=%d pos=(%.3f,%.3f,%.3f)",
+                                 m_slam_kernel->getSlamAnchorCount(), p.x, p.y, p.z);
+                        DEBUG_INFO("[Android Slam App Info] %s", buf);
+                        AssetManager::appendLog(buf);
                     }
                 }
-                else if(!m_scale_flag)
-                    m_scale = 1.0f;
-            }
+                ImGui::SameLine();
+                ImGui::Text(u8"锚点 %d/%d",
+                            m_slam_kernel->getSlamAnchorCount(),
+                            m_slam_kernel->getWorldAnchorCount());
 
-            if (ImGui::Button(m_Rt_flag ? u8"还原坐标" : u8"转换坐标"))
-            {
-                m_Rt_flag = !m_Rt_flag;
-                if(m_Rt_flag) {
-                    if(!tracking_res.trajectory.empty() && m_slam_kernel->getPtsRelSize() < 3) {
-                        float x = tracking_res.trajectory.back().x;
-                        float y = tracking_res.trajectory.back().y;
-                        float z = tracking_res.trajectory.back().z;
-                        m_slam_kernel->setPtsRel(x, y, z);
-                        m_slam_kernel->CalculateRt();
+                if (ImGui::Button(u8"清除锚点"))
+                {
+                    m_slam_kernel->clearAnchors();
+                    DEBUG_INFO("[Android Slam App Info] anchors cleared.");
+                    AssetManager::appendLog("anchors cleared");
+                }
+
+                if (ImGui::Button(aligned ? u8"还原坐标" : u8"对齐坐标"))
+                {
+                    if (aligned)
+                    {
+                        m_slam_kernel->resetAlignment();
+                        DEBUG_INFO("[Android Slam App Info] alignment reset.");
+                        AssetManager::appendLog("alignment reset");
                     }
-                    else if(m_slam_kernel->getPtsRelSize() == 3)
-                        m_slam_kernel->setCalRt(true);
                     else
-                        m_slam_kernel->setCalRt(false);
+                    {
+                        if (m_slam_kernel->computeAlignment())
+                        {
+                            char buf[128];
+                            snprintf(buf, sizeof(buf), "alignment ok scale=%.4f",
+                                     m_slam_kernel->getSimScale());
+                            DEBUG_INFO("[Android Slam App Info] %s", buf);
+                            AssetManager::appendLog(buf);
+                        }
+                        else
+                        {
+                            DEBUG_INFO("[Android Slam App Info] alignment failed (need >=3 non-collinear anchors).");
+                            AssetManager::appendLog("alignment failed (need >=3 non-collinear anchors)");
+                        }
+                    }
                 }
-                else
-                    m_slam_kernel->setCalRt(false);
             }
-
             if (ImGui::Button(u8"保存轨迹"))
             {
                 m_file_manager->getTraj(tracking_res);

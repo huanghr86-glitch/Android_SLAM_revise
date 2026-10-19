@@ -83,16 +83,8 @@ namespace android_slam
         //本地文件管理
         std::unique_ptr<AssetManager> m_file_manager;
 
-        //第一个标志位
-        bool m_first_flag = false;
-
-        //标定尺度标志位
-        bool m_scale_flag = false;
-        float m_scale = 1.0f;
         TrackingResult tracking_res; //主线程结果存放
 
-        //Rt第三个标志位
-        bool m_Rt_flag = false;
         //记录保存点数
         int markNum = 1;
 
