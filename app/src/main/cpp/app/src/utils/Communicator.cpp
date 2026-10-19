@@ -174,9 +174,10 @@ namespace android_slam
         commu_data.reserve(point_count * 3u);
         for (const auto& data : track_res.trajectory)
         {
-            commu_data.push_back(data.x + start_pos[0]);
-            commu_data.push_back(data.z + start_pos[1]);
-            commu_data.push_back(data.y + start_pos[2]);
+            const auto p = toOutputPos(data); // 内部(east,up,north) -> 输出(east,north,up)
+            commu_data.push_back(p.x + start_pos[0]);
+            commu_data.push_back(p.y + start_pos[1]);
+            commu_data.push_back(p.z + start_pos[2]);
         }
         sendAll(socket_fd, commu_data.data(), sizeof(float) * commu_data.size());
         DEBUG_INFO("[Android Slam App Info] sent %lu floats", (unsigned long) commu_data.size());

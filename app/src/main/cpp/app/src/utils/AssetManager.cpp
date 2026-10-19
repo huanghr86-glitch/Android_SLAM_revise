@@ -87,8 +87,10 @@ namespace android_slam
             //打开文件成功"
             DEBUG_INFO("[AssetManager::savetraj] Open file successfully");
             for(int i = 0; i < result.trajectory.size(); ++i)
-                //fprintf(file, "%f %f %f\n", result.trajectory[i].x, result.trajectory[i].y, result.trajectory[i].z);
-                fprintf(file, "%f %f %f\n", result.trajectory[i].x, result.trajectory[i].z, result.trajectory[i].y);
+            {
+                const auto p = toOutputPos(result.trajectory[i]); // 内部(east,up,north) -> 输出(east,north,up)
+                fprintf(file, "%f %f %f\n", p.x, p.y, p.z);
+            }
             DEBUG_INFO("[AssetManager::savetraj] finish saving ");
             fclose(file);
         } else {
@@ -107,7 +109,10 @@ namespace android_slam
             //打开文件成功"
             DEBUG_INFO("[AssetManager::saveCurPos] Open file successfully");
             //fprintf(file, "%f %f %f\n", result.trajectory.back().x, result.trajectory.back().y, result.trajectory.back().z);
-            fprintf(file, "%f %f %f\n", result.trajectory.back().x, result.trajectory.back().z, result.trajectory.back().y);
+            {
+                const auto p = toOutputPos(result.trajectory.back());
+                fprintf(file, "%f %f %f\n", p.x, p.y, p.z);
+            }
             DEBUG_INFO("[AssetManager::saveCurPos] finish saving ");
             fclose(file);
         } else {

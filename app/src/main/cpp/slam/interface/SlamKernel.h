@@ -38,6 +38,10 @@ namespace android_slam
         int64_t time_stamp;
     };
 
+    // 坐标契约（GNSS 融合前固化）：
+    //   内部 SLAM/世界: (x=east, y=up, z=north)
+    //   输出(PC/文件):  (x=east, y=north, z=up)  —— 即内部 y/z 交换
+    //   GNSS 的 ENU:   (east, north, up)
     struct TrackingResult
     {
         struct Pos
@@ -48,12 +52,25 @@ namespace android_slam
         };
 
         std::array<float, 16> last_pose;
+        int64_t time_stamp = 0;   // 该帧相机时间戳(单调纳秒)，用于与 GNSS 对齐
         std::vector<Pos> trajectory;
         std::vector<Pos> map_points;
         std::string tracking_status;
 
         float processing_delta_time;
     };
+
+    // 内部坐标 -> 输出坐标: (east, up, north) -> (east, north, up)
+    inline TrackingResult::Pos toOutputPos(const TrackingResult::Pos& p)
+    {
+        return TrackingResult::Pos{ p.x, p.z, p.y };
+    }
+
+    // GNSS 的 ENU(east, north, up) -> 内部世界坐标(east, up, north)
+    inline Eigen::Vector3f enuToInternal(float east, float north, float up)
+    {
+        return Eigen::Vector3f(east, up, north);
+    }
 
     class SlamKernel
     {
@@ -72,7 +89,10 @@ namespace android_slam
         void reset();
 
         // 锚点对齐：raw SLAM 坐标 <-> 真实世界坐标，Umeyama 相似变换
+        // addSlamAnchor: 记录 raw SLAM 锚点(内部 SLAM 坐标)
         void addSlamAnchor(float x, float y, float z);
+        // setWorldAnchors: 世界锚点，单位为内部世界坐标(east,up,north)；
+        //   GNSS 阶段请先用 enuToInternal() 把 ENU(east,north,up) 转换过来。
         void setWorldAnchors(const std::vector<Eigen::Vector3f>& anchors);
         void clearAnchors();
         int getSlamAnchorCount() const;

@@ -124,6 +124,7 @@ namespace android_slam
         }
 
         const Image& image = images[0];
+        res.time_stamp = image.time_stamp;
         assert((image.time_stamp >= m_begin_time_stamp) && "Invalid time stamp.");
 
         cv::Mat cv_image(m_height, m_width, CV_8UC3);
