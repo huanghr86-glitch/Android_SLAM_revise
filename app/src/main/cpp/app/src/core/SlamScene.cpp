@@ -258,8 +258,9 @@ namespace android_slam
                 }
                 char line[256];
                 snprintf(line, sizeof(line),
-                         "frame=%d state=%s dt=%.4f scale=%.4f pos=(%.4f,%.4f,%.4f) traj=%lu mp=%lu",
+                         "frame=%d ts=%lld state=%s dt=%.4f scale=%.4f pos=(%.4f,%.4f,%.4f) traj=%lu mp=%lu",
                          m_log_frame_index++,
+                         (long long) tracking_res.time_stamp,
                          tracking_res.tracking_status.c_str(),
                          tracking_res.processing_delta_time,
                          m_slam_kernel->getSimScale(),
