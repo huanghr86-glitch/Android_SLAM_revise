@@ -602,8 +602,9 @@ Eigen::Vector3f Frame::GetRelativePoseTlr_translation() {
 }
 
 
-bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
+bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit, int* reason)
 {
+    if (reason) *reason = 5;
     if(Nleft == -1){
         pMP->mbTrackInView = false;
         pMP->mTrackProjX = -1;
@@ -620,14 +621,23 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
         const float &PcZ = Pc(2);
         const float invz = 1.0f/PcZ;
         if(PcZ<0.0f)
+        {
+            if (reason) *reason = 1;
             return false;
+        }
 
         const Eigen::Vector2f uv = mpCamera->project(Pc);
 
         if(uv(0)<mnMinX || uv(0)>mnMaxX)
+        {
+            if (reason) *reason = 2;
             return false;
+        }
         if(uv(1)<mnMinY || uv(1)>mnMaxY)
+        {
+            if (reason) *reason = 2;
             return false;
+        }
 
         pMP->mTrackProjX = uv(0);
         pMP->mTrackProjY = uv(1);
@@ -639,7 +649,10 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
         const float dist = PO.norm();
 
         if(dist<minDistance || dist>maxDistance)
+        {
+            if (reason) *reason = 3;
             return false;
+        }
 
         // Check viewing angle
         Eigen::Vector3f Pn = pMP->GetNormal();
@@ -647,7 +660,10 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
         const float viewCos = PO.dot(Pn)/dist;
 
         if(viewCos<viewingCosLimit)
+        {
+            if (reason) *reason = 4;
             return false;
+        }
 
         // Predict scale in the image
         const int nPredictedLevel = pMP->PredictScale(dist,this);
@@ -663,6 +679,7 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
         pMP->mnTrackScaleLevel= nPredictedLevel;
         pMP->mTrackViewCos = viewCos;
 
+        if (reason) *reason = 0;
         return true;
     }
     else{
@@ -674,7 +691,9 @@ bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
         pMP->mbTrackInView = isInFrustumChecks(pMP,viewingCosLimit);
         pMP->mbTrackInViewR = isInFrustumChecks(pMP,viewingCosLimit,true);
 
-        return pMP->mbTrackInView || pMP->mbTrackInViewR;
+        const bool visible = pMP->mbTrackInView || pMP->mbTrackInViewR;
+        if (reason && visible) *reason = 0;
+        return visible;
     }
 }
 

@@ -25,6 +25,9 @@ namespace android_slam
         SensorCamera m_sensor_camera;
         int32_t m_width;
         int32_t m_height;
+        int64_t m_last_timestamp = -1;
+        uint64_t m_duplicate_polls = 0;
+        uint64_t m_backward_images = 0;
 
         uint32_t m_fbo;
         uint32_t m_color_attachment;

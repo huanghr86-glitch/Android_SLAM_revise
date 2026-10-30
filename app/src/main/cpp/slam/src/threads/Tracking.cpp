@@ -21,6 +21,10 @@
 #include <iostream>
 #include <mutex>
 #include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <memory>
+#include <unordered_set>
 
 #include "core/System.h"
 
@@ -31,6 +35,9 @@
 
 #include "utils/Converter.h"
 #include "utils/GeometricTools.h"
+#include "utils/RecoveryPointPool.h"
+#include "utils/CornerGeometryDiagnostics.h"
+#include "utils/RecoveryValidation.h"
 
 #include "solver/G2oTypes.h"
 #include "solver/Optimizer.h"
@@ -43,6 +50,227 @@ using namespace std;
 
 namespace ORB_SLAM3
 {
+    namespace
+    {
+        struct RecoveryPoolSnapshot
+        {
+            bool built = false;
+            vector<RecoveryProjectionPoint> points;
+            unordered_set<unsigned long> extra_ids;
+            size_t seed_points = 0;
+        };
+
+        RecoveryPoolSnapshot BuildRecoveryPool(KeyFrame* seed, Map* active_map,
+                const vector<KeyFrame*>& recent_keyframes, unsigned long frame_id, double timestamp,
+                vector<string>* log_lines)
+        {
+            const auto began = std::chrono::steady_clock::now();
+            RecoveryPoolSnapshot result;
+            result.built = true;
+            vector<pair<KeyFrame*, int>> sources;
+            set<unsigned long> source_ids;
+            int recent_added = 0, covis_added = 0;
+            auto add_source = [&](KeyFrame* keyframe, int kind) {
+                if (!keyframe || keyframe->isBad() || keyframe->GetMap() != active_map ||
+                    !source_ids.insert(keyframe->mnId).second) return false;
+                sources.emplace_back(keyframe, kind);
+                return true;
+            };
+            add_source(seed, 0);
+            for (KeyFrame* keyframe : recent_keyframes)
+            {
+                if (recent_added >= kRecoveryPoolRecentKeyFrames) break;
+                if (add_source(keyframe, 1)) ++recent_added;
+            }
+            if (seed && !seed->isBad())
+                for (KeyFrame* keyframe : seed->GetBestCovisibilityKeyFrames(kRecoveryPoolCovisKeyFrames))
+                    if (add_source(keyframe, 2)) ++covis_added;
+
+            RecoveryPointPoolBuilder<RecoveryProjectionPoint> builder(kRecoveryPoolMaxPoints);
+            size_t slots = 0, null_points = 0, bad_points = 0, wrong_map = 0, no_observations = 0, bad_index = 0;
+            for (const auto& source : sources)
+            {
+                const auto points = source.first->GetMapPointMatches();
+                const size_t before_size = builder.size(), before_offered = builder.offered;
+                const size_t before_duplicates = builder.duplicates, before_dropped = builder.dropped;
+                slots += points.size();
+                for (size_t index = 0; index < points.size(); ++index)
+                {
+                    MapPoint* point = points[index];
+                    if (!point) { ++null_points; continue; }
+                    if (point->isBad()) { ++bad_points; continue; }
+                    if (point->GetMap() != active_map) { ++wrong_map; continue; }
+                    if (point->Observations() < 1) { ++no_observations; continue; }
+                    if (index >= source.first->mvKeysUn.size()) { ++bad_index; continue; }
+                    if (builder.Add(point->mnId, {point, source.first, index, source.second}) && source.second == 0)
+                        ++result.seed_points;
+                }
+                if (log_lines)
+                    AppendCornerEvent(*log_lines, "SLAM_RELOC_POOL_SOURCE frame=%lu ts=%.9f seed=%lu source=%lu kind=%d age_s=%.6f slots=%zu offered=%zu added=%zu duplicates=%zu dropped=%zu",
+                            frame_id, timestamp, seed->mnId, source.first->mnId, source.second,
+                            timestamp - source.first->mTimeStamp, points.size(), builder.offered - before_offered,
+                            builder.size() - before_size, builder.duplicates - before_duplicates, builder.dropped - before_dropped);
+            }
+            const size_t point_count = builder.size();
+            result.points = builder.Take();
+            for (const auto& point : result.points)
+                if (point.source_kind != 0) result.extra_ids.insert(point.point->mnId);
+            if (log_lines)
+                AppendCornerEvent(*log_lines, "SLAM_RELOC_POOL frame=%lu ts=%.9f seed=%lu map=%lu sources=%zu recent_sources=%d covis_sources=%d slots=%zu null=%zu bad=%zu wrong_map=%zu no_obs=%zu bad_index=%zu offered=%zu duplicates=%zu dropped=%zu points=%zu seed_points=%zu extra_points=%zu capacity=%zu max_expansions=%d build_ms=%.3f",
+                        frame_id, timestamp, seed->mnId, active_map->GetId(), sources.size(), recent_added, covis_added,
+                        slots, null_points, bad_points, wrong_map, no_observations, bad_index, builder.offered,
+                        builder.duplicates, builder.dropped, point_count, result.seed_points,
+                        point_count - result.seed_points, kRecoveryPoolMaxPoints, kRecoveryPoolMaxExpansions,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+            return result;
+        }
+
+        int CountRecoveryExtraInliers(const Frame& frame, const RecoveryPoolSnapshot& pool)
+        {
+            int count = 0;
+            for (size_t i = 0; i < frame.mvpMapPoints.size(); ++i)
+                if (frame.mvpMapPoints[i] && !frame.mvbOutlier[i] &&
+                    !frame.mvpMapPoints[i]->isBad() && frame.mvpMapPoints[i]->Observations() > 0 &&
+                    pool.extra_ids.count(frame.mvpMapPoints[i]->mnId)) ++count;
+            return count;
+        }
+
+        struct RecoveryResidual { unsigned long point; size_t feature; int octave; double raw, chi2, inverse_variance; };
+
+        RecoveryQuality MeasureRecoveryQuality(const Frame& frame, Map* active_map,
+                const Sophus::SE3f* previous, const RecoveryPoolSnapshot* pool = nullptr,
+                vector<RecoveryResidual>* residuals = nullptr)
+        {
+            RecoveryQuality q;
+            const auto pose = frame.GetPose();
+            vector<double> errors, depths, normalized;
+            unordered_set<unsigned long> unique;
+            bool cells[48] = {};
+            double squared = 0, normalized_squared = 0;
+            for (size_t i = 0; i < frame.mvpMapPoints.size() && i < frame.mvKeysUn.size(); ++i)
+            {
+                MapPoint* point = frame.mvpMapPoints[i];
+                if (!point || frame.mvbOutlier[i]) continue;
+                ++q.associations;
+                if (point->isBad() || point->Observations() < 1 || point->GetMap() != active_map)
+                { ++q.invalid; continue; }
+                if (!unique.insert(point->mnId).second) { ++q.duplicates; continue; }
+                const Eigen::Vector3f camera = pose * point->GetWorldPos();
+                if (!RecoveryFinite(camera.x()) || !RecoveryFinite(camera.y()) ||
+                    !RecoveryFinite(camera.z()) || camera.z() <= 1e-6)
+                { ++q.invalid; continue; }
+                const auto projected = frame.mpCamera->project(camera);
+                const auto observed = frame.mvKeysUn[i].pt;
+                const double error = std::hypot(double(projected.x()) - observed.x, double(projected.y()) - observed.y);
+                if (!RecoveryFinite(error)) { ++q.invalid; continue; }
+                const int octave = frame.mvKeysUn[i].octave;
+                if (octave < 0 || octave >= static_cast<int>(frame.mvInvLevelSigma2.size()))
+                { ++q.invalid; continue; }
+                const double inverse_variance = frame.mvInvLevelSigma2[octave];
+                const double chi2 = RecoveryChi2(error, inverse_variance);
+                if (!RecoveryFinite(chi2) || chi2 < 0) { ++q.invalid; continue; }
+                normalized.push_back(std::sqrt(chi2));
+                normalized_squared += chi2;
+                q.max_chi2 = std::max(q.max_chi2, chi2);
+                if (chi2 > kRecoveryChi2 + .0001) ++q.chi2_over;
+                if (residuals && residuals->size() < kRecoveryPointLogLimit)
+                    residuals->push_back({point->mnId, i, octave, error, chi2, inverse_variance});
+                errors.push_back(error);
+                depths.push_back(camera.z());
+                squared += error * error;
+                ++q.unique;
+                if (pool && pool->extra_ids.count(point->mnId)) ++q.extra;
+                const int x = std::max(0, std::min(7, static_cast<int>((observed.x-frame.mnMinX)*8/(frame.mnMaxX-frame.mnMinX))));
+                const int y = std::max(0, std::min(5, static_cast<int>((observed.y-frame.mnMinY)*6/(frame.mnMaxY-frame.mnMinY))));
+                cells[y*8+x] = true;
+            }
+            for (bool cell : cells) if (cell) ++q.cells;
+            if (!errors.empty())
+            {
+                sort(errors.begin(), errors.end());
+                sort(depths.begin(), depths.end());
+                sort(normalized.begin(), normalized.end());
+                q.rmse = std::sqrt(squared/errors.size());
+                q.median = errors[errors.size()/2];
+                q.p95 = errors[std::min(errors.size()-1, errors.size()*95/100)];
+                q.normalized_rmse = std::sqrt(normalized_squared/errors.size());
+                q.normalized_p95 = normalized[std::min(normalized.size()-1, normalized.size()*95/100)];
+                q.median_depth = depths[depths.size()/2];
+                if (previous)
+                {
+                    const auto delta = pose * previous->inverse();
+                    q.rotation_deg = delta.so3().log().norm()*180.0/M_PI;
+                    q.translation_depth = delta.translation().norm()/q.median_depth;
+                }
+            }
+            return q;
+        }
+
+        void AppendRecoveryResiduals(vector<string>& lines, const char* source, const Frame& frame,
+                int total, const vector<RecoveryResidual>& residuals)
+        {
+            AppendCornerEvent(lines, "SLAM_QUALITY_POINTS frame=%lu ts=%.9f source=%s total=%d emitted=%zu limit=%d",
+                    frame.mnId, frame.mTimeStamp, source, total, residuals.size(), kRecoveryPointLogLimit);
+            for (const auto& p : residuals)
+                AppendCornerEvent(lines, "SLAM_QUALITY_POINT frame=%lu ts=%.9f source=%s point=%lu feature=%zu octave=%d error_px=%.9f inv_sigma2=%.9f chi2=%.9f",
+                        frame.mnId, frame.mTimeStamp, source, p.point, p.feature, p.octave, p.raw, p.inverse_variance, p.chi2);
+        }
+
+        vector<KeyFrame*> RecentRecoveryKeyFrames(Map* map, double timestamp)
+        {
+            vector<KeyFrame*> frames;
+            for (KeyFrame* keyframe : map->GetAllKeyFrames())
+                if (!keyframe->isBad() && keyframe->GetMap() == map && timestamp >= keyframe->mTimeStamp &&
+                    timestamp-keyframe->mTimeStamp <= kRecoveryPoolRecentSeconds) frames.push_back(keyframe);
+            sort(frames.begin(), frames.end(), [](KeyFrame* a, KeyFrame* b) {
+                return a->mTimeStamp == b->mTimeStamp ? a->mnId > b->mnId : a->mTimeStamp > b->mTimeStamp;
+            });
+            return frames;
+        }
+
+        void DeduplicateRecoveryFrame(Frame& frame)
+        {
+            unordered_set<unsigned long> ids;
+            for (auto& point : frame.mvpMapPoints)
+                if (point && !ids.insert(point->mnId).second) point = nullptr;
+        }
+
+        void LogRecoveryVerification(Frame& frame, KeyFrame* seed, const RecoveryPoolSnapshot& pool,
+                int optimized_inliers, vector<string>& lines)
+        {
+            const auto pose = frame.GetPose();
+            vector<float> errors;
+            double squared_error = 0;
+            int invalid = 0, extra_inliers = 0;
+            bool cells[48] = {};
+            for (size_t i = 0; i < frame.mvpMapPoints.size() && i < frame.mvKeysUn.size(); ++i)
+            {
+                MapPoint* point = frame.mvpMapPoints[i];
+                if (!point || frame.mvbOutlier[i] || point->isBad() || point->Observations() < 1) continue;
+                const Eigen::Vector3f camera = pose * point->GetWorldPos();
+                if (!CornerFinite(camera.x()) || !CornerFinite(camera.y()) || !CornerFinite(camera.z()) || camera.z() <= 0)
+                { ++invalid; continue; }
+                const auto pixel = frame.mpCamera->project(camera);
+                const auto observed = frame.mvKeysUn[i].pt;
+                const float error = std::hypot(pixel.x() - observed.x, pixel.y() - observed.y);
+                if (!CornerFinite(error)) { ++invalid; continue; }
+                errors.push_back(error);
+                squared_error += error * error;
+                if (pool.extra_ids.count(point->mnId)) ++extra_inliers;
+                const int x = std::max(0, std::min(7, static_cast<int>((observed.x - frame.mnMinX) * 8 / (frame.mnMaxX - frame.mnMinX))));
+                const int y = std::max(0, std::min(5, static_cast<int>((observed.y - frame.mnMinY) * 6 / (frame.mnMaxY - frame.mnMinY))));
+                cells[y * 8 + x] = true;
+            }
+            std::sort(errors.begin(), errors.end());
+            int occupied = 0;
+            for (bool cell : cells) if (cell) ++occupied;
+            AppendCornerEvent(lines, "SLAM_RELOC_VERIFY frame=%lu ts=%.9f seed=%lu optimized_inliers=%d checked=%zu extra_inliers=%d cells=%d invalid_projection=%d rmse_px=%.6f median_px=%.6f p95_px=%.6f stage=candidate_gate",
+                    frame.mnId, frame.mTimeStamp, seed->mnId, optimized_inliers, errors.size(), extra_inliers,
+                    occupied, invalid, errors.empty() ? -1 : std::sqrt(squared_error / errors.size()),
+                    errors.empty() ? -1 : errors[errors.size() / 2],
+                    errors.empty() ? -1 : errors[std::min(errors.size() - 1, errors.size() * 95 / 100)]);
+        }
+    }
 
 
     Tracking::Tracking(System* pSys,
@@ -1169,6 +1397,8 @@ namespace ORB_SLAM3
 
     Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat& im, const double& timestamp, string filename)
     {
+        mFrameDiagnostics = FrameDiagnostics{};
+        SetCornerFrameTime(timestamp);
         mImGray = im;
         if (mImGray.channels() == 3)
         {
@@ -1219,8 +1449,30 @@ namespace ORB_SLAM3
         mCurrentFrame.mnDataset = mnNumDataset;
 
         lastID = mCurrentFrame.mnId;
+        mFrameDiagnostics.frame_id = mCurrentFrame.mnId;
+        mFrameDiagnostics.keypoints = mCurrentFrame.N;
+        bool occupied[48] = {};
+        for (const auto& key : mCurrentFrame.mvKeys)
+        {
+            const int x = std::max(0, std::min(7, static_cast<int>(key.pt.x * 8 / mImGray.cols)));
+            const int y = std::max(0, std::min(5, static_cast<int>(key.pt.y * 6 / mImGray.rows)));
+            occupied[y * 8 + x] = true;
+        }
+        for (bool cell : occupied) if (cell) ++mFrameDiagnostics.keypoint_cells;
         Track();
 
+        Map* debug_map = mpAtlas->GetCurrentMap();
+        if (debug_map && (mState == OK || mState == RECENTLY_LOST))
+        {
+            const auto index = mpKeyFrameDB->GetDebugIndexStats(debug_map->GetId(), mpReferenceKF, mpLastKeyFrame);
+            mFrameDiagnostics.ref_kf = mpReferenceKF ? static_cast<long>(mpReferenceKF->mnId) : -1;
+            mFrameDiagnostics.last_kf = mpLastKeyFrame ? static_cast<long>(mpLastKeyFrame->mnId) : -1;
+            mFrameDiagnostics.ref_in_db = index.ref_present;
+            mFrameDiagnostics.last_in_db = index.last_present;
+            mFrameDiagnostics.db_map_kfs = index.map_kfs;
+            mFrameDiagnostics.db_newest_kf = index.newest_kf;
+            if (index.newest_ts >= 0) mFrameDiagnostics.db_newest_age_s = timestamp - index.newest_ts;
+        }
         return mCurrentFrame.GetPose();
     }
 
@@ -1401,6 +1653,7 @@ namespace ORB_SLAM3
     {
         if (mpLocalMapper->mbBadImu)
         {
+            mFrameDiagnostics.event = "bad_imu_reset_requested";
             cout << "TRACK: Reset map because local mapper set the bad imu flag " << endl;
             mpSystem->ResetActiveMap();
             return;
@@ -1416,6 +1669,7 @@ namespace ORB_SLAM3
         {
             if (mLastFrame.mTimeStamp > mCurrentFrame.mTimeStamp)
             {
+                mFrameDiagnostics.event = "timestamp_backwards_new_map";
                 cerr << "ERROR: Frame with a timestamp older than previous frame detected!" << endl;
                 unique_lock<mutex> lock(mMutexImuQueue);
                 mlQueueImuData.clear();
@@ -1462,6 +1716,7 @@ namespace ORB_SLAM3
         }
 
         mLastProcessedState = mState;
+        if (mLastProcessedState != OK) mCornerFallbackStreak = 0;
 
         if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !mbCreatedMap)
         {
@@ -1569,6 +1824,7 @@ namespace ORB_SLAM3
 
                     if (mState == RECENTLY_LOST)
                     {
+                        mFrameDiagnostics.lost_s = mCurrentFrame.mTimeStamp - mTimeStampLost;
                         Verbose::PrintMess("Lost for a short time", Verbose::VERBOSITY_NORMAL);
 
                         bOK = true;
@@ -1589,7 +1845,9 @@ namespace ORB_SLAM3
                         else
                         {
                             // Relocalization
-                            bOK = Relocalization();
+                            bool short_handled = false;
+                            bOK = TryShortMapRecovery(short_handled);
+                            if (!short_handled) bOK = Relocalization();
                             //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
                             //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
                             DEBUG_INFO("[Track] mCurrentFrame.mTimeStamp = %f", mCurrentFrame.mTimeStamp);
@@ -1598,6 +1856,7 @@ namespace ORB_SLAM3
                             DEBUG_INFO("[Track] bOK = %d", bOK);
                             if (mCurrentFrame.mTimeStamp - mTimeStampLost > 1.5f && !bOK)//原3fs
                             {
+                                mFrameDiagnostics.event = "visual_reloc_timeout";
                                 mState = LOST;
                                 Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
                                 bOK = false;
@@ -1611,6 +1870,7 @@ namespace ORB_SLAM3
 
                         if (pCurrentMap->KeyFramesInMap() < 10)
                         {
+                            mFrameDiagnostics.event = "lost_small_map_reset_requested";
                             mpSystem->ResetActiveMap();
                             Verbose::PrintMess("Reseting current map...", Verbose::VERBOSITY_NORMAL);
                         }
@@ -1719,7 +1979,20 @@ namespace ORB_SLAM3
                 if (bOK)
                 {
                     bOK = TrackLocalMap();
-
+                    if (mFrameDiagnostics.short_confirmed)
+                    {
+                        const auto q = MeasureRecoveryQuality(mCurrentFrame, pCurrentMap, &mCornerShortPreviousPose);
+                        bOK = bOK && AcceptLocalFallback(q);
+                        mFrameDiagnostics.short_final_ok = bOK ? 1 : 0;
+                        mFrameDiagnostics.local_ok = bOK ? 1 : 0;
+                        WriteCornerEvent("SlamReloc.txt", "SLAM_SHORT_FINAL frame=%lu ts=%.9f map=%lu unique=%d cells=%d invalid=%d normalized_rmse=%.9f max_chi2=%.9f chi2_over=%d rotation_deg=%.6f translation_depth=%.9f accepted=%d local_inliers=%d",
+                                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, pCurrentMap->GetId(), q.unique,
+                                q.cells, q.invalid, q.normalized_rmse, q.max_chi2, q.chi2_over,
+                                q.rotation_deg, q.translation_depth, bOK ? 1 : 0, mFrameDiagnostics.local_inliers);
+                        ClearShortMapRecovery();
+                    }
+                    if (bOK) mCornerFallbackStreak = 0;
+                    else if (mState == OK) bOK = TryLocalTrackingFallback();
                 }
                 if (!bOK)
                     //cout << "Fail to track local map!" << endl;
@@ -1735,7 +2008,10 @@ namespace ORB_SLAM3
             }
 
             if (bOK)
+            {
+                ClearShortMapRecovery();
                 mState = OK;
+            }
             else if (mState == OK)
             {
                 if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
@@ -1862,6 +2138,7 @@ namespace ORB_SLAM3
             {
                 if (pCurrentMap->KeyFramesInMap() <= 10)
                 {
+                    mFrameDiagnostics.event = "lost_small_map_reset_requested";
                     mpSystem->ResetActiveMap();
                     return;
                 }
@@ -1889,6 +2166,12 @@ namespace ORB_SLAM3
 
 
 
+        if (mState == OK && mCurrentFrame.isSet())
+        {
+            mCornerLastGoodPose = mCurrentFrame.GetPose();
+            mCornerLastGoodTime = mCurrentFrame.mTimeStamp;
+            mCornerLastGoodMap = pCurrentMap;
+        }
         if (mState == OK || mState == RECENTLY_LOST)
         {
             // Store frame pose information to retrieve the complete camera trajectory afterwards.
@@ -2253,6 +2536,15 @@ namespace ORB_SLAM3
 
     void Tracking::CreateMapInAtlas()
     {
+        ClearShortMapRecovery();
+        mCornerLastGoodTime = -1;
+        mCornerLastGoodMap = nullptr;
+        mCornerFallbackStreak = 0;
+        if (std::string(mFrameDiagnostics.event) == "none")
+            mFrameDiagnostics.event = "create_new_map";
+        __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG",
+                "SLAM_EVENT type=create_map frame=%lu ts=%.9f reason=%s",
+                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, mFrameDiagnostics.event);
         mnLastInitFrameId = mCurrentFrame.mnId;
         mpAtlas->CreateNewMap();
         if (mSensor == System::IMU_STEREO || mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_RGBD)
@@ -2328,6 +2620,7 @@ namespace ORB_SLAM3
         vector<MapPoint*> vpMapPointMatches;
 
         int nmatches = matcher.SearchByBoW(mpReferenceKF, mCurrentFrame, vpMapPointMatches);
+        mFrameDiagnostics.ref_raw = nmatches;
 
         if (nmatches < 15)
         {
@@ -2372,6 +2665,7 @@ namespace ORB_SLAM3
             }
         }
 
+        mFrameDiagnostics.ref_inliers = nmatchesMap;
         if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
             return true;
         else
@@ -2484,6 +2778,7 @@ namespace ORB_SLAM3
             th = 15;
 
         int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, th, mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
+        mFrameDiagnostics.motion_raw = nmatches;
 
         // If few matches, uses a wider window search
         if (nmatches < 20)
@@ -2492,6 +2787,7 @@ namespace ORB_SLAM3
             fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint*>(NULL));
 
             nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2 * th, mSensor == System::MONOCULAR || mSensor == System::IMU_MONOCULAR);
+            mFrameDiagnostics.motion_wide = nmatches;
             Verbose::PrintMess("Matches with wider search: " + to_string(nmatches), Verbose::VERBOSITY_NORMAL);
 
         }
@@ -2535,6 +2831,7 @@ namespace ORB_SLAM3
             }
         }
         //DEBUG_INFO("[TrackWithMotionModel] nmatchesMap = %d ", nmatchesMap);
+        mFrameDiagnostics.motion_inliers = nmatchesMap;
         if (mbOnlyTracking)
         {
             mbVO = nmatchesMap < 10;
@@ -2547,14 +2844,206 @@ namespace ORB_SLAM3
             return nmatchesMap >= 10;
     }
 
+    void Tracking::ClearShortMapRecovery()
+    {
+        mCornerShortChain.Reset();
+        mCornerShortFrame.reset();
+    }
+
+    bool Tracking::TryShortMapRecovery(bool& handled)
+    {
+        handled = false;
+        if (!CornerShortRecoveryEnabled() || mSensor != System::MONOCULAR || mbOnlyTracking ||
+            mState != RECENTLY_LOST || !mCornerShortFrame || !mCornerShortChain.active) return false;
+        Map* map = mpAtlas->GetCurrentMap();
+        const double age = mCurrentFrame.mTimeStamp-mCornerLastGoodTime;
+        const double gap = mCurrentFrame.mTimeStamp-mCornerShortChain.timestamp;
+        if (mCornerLastGoodMap != map || map->GetId() != mCornerShortChain.map || age <= 0 ||
+            age > kShortRecoveryWindow || gap <= 0 || gap > kFallbackMaxFrameGap)
+        {
+            WriteCornerEvent("SlamReloc.txt", "SLAM_SHORT_RESET frame=%lu ts=%.9f reason=window_or_map age_s=%.6f gap_s=%.6f",
+                    mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, age, gap);
+            ClearShortMapRecovery();
+            return false;
+        }
+        KeyFrame* seed = mCornerShortFrame->mpReferenceKF;
+        if (!seed || seed->isBad() || seed->GetMap() != map) seed = mpLastKeyFrame;
+        if (!seed || seed->isBad() || seed->GetMap() != map) { ClearShortMapRecovery(); return false; }
+        const auto began = std::chrono::steady_clock::now();
+        Frame original; original.copyFrom(mCurrentFrame);
+        const auto prior_pose = mCornerShortFrame->GetPose();
+        const auto prior_frame = mCornerShortChain.frame;
+        const int prior_points = mCornerShortChain.points;
+        unordered_set<unsigned long> previous_ids;
+        for (MapPoint* point : mCornerShortFrame->mvpMapPoints)
+            if (point && !point->isBad() && point->GetMap() == map) previous_ids.insert(point->mnId);
+        mCurrentFrame.SetPose(prior_pose);
+        mCurrentFrame.mvpMapPoints.assign(mCurrentFrame.N, nullptr);
+        mCurrentFrame.mvbOutlier.assign(mCurrentFrame.N, false);
+        auto pool = BuildRecoveryPool(seed, map, RecentRecoveryKeyFrames(map, mCurrentFrame.mTimeStamp),
+                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, nullptr);
+        ORBmatcher matcher(.9, true);
+        set<MapPoint*> found;
+        const int seed_added = matcher.SearchByProjection(mCurrentFrame, seed, found, 10, 100);
+        for (MapPoint* point : mCurrentFrame.mvpMapPoints) if (point) found.insert(point);
+        RecoveryProjectionDiagnostics projection;
+        const int extra_added = matcher.SearchRecoveryPool(mCurrentFrame, pool.points, found, 10, 100, projection);
+        DeduplicateRecoveryFrame(mCurrentFrame);
+        Optimizer::PoseOptimization(&mCurrentFrame);
+        vector<RecoveryResidual> residuals;
+        const auto q = MeasureRecoveryQuality(mCurrentFrame, map, &prior_pose, &pool, &residuals);
+        auto anchor = q;
+        const auto anchor_delta = mCurrentFrame.GetPose()*mCornerLastGoodPose.inverse();
+        anchor.rotation_deg = anchor_delta.so3().log().norm()*180.0/M_PI;
+        anchor.translation_depth = q.median_depth > 0 ? anchor_delta.translation().norm()/q.median_depth : -1;
+        const bool valid = AcceptLocalFallback(q) && AcceptShortAnchor(anchor, age);
+        int shared = 0;
+        for (size_t i = 0; i < mCurrentFrame.mvpMapPoints.size(); ++i)
+            if (mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i] &&
+                previous_ids.count(mCurrentFrame.mvpMapPoints[i]->mnId)) ++shared;
+        bool confirmed = false;
+        if (valid)
+        {
+            confirmed = mCornerShortChain.Observe(map->GetId(), mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, q.unique, shared);
+            mCornerShortPreviousPose = prior_pose;
+            for (size_t i = 0; i < mCurrentFrame.mvpMapPoints.size(); ++i)
+                if (mCurrentFrame.mvbOutlier[i]) mCurrentFrame.mvpMapPoints[i] = nullptr;
+            mCornerShortFrame->copyFrom(mCurrentFrame);
+            mCornerShortFrame->mpReferenceKF = seed;
+            mFrameDiagnostics.short_pending = 1;
+            mFrameDiagnostics.short_confirmed = confirmed ? 1 : 0;
+            if (confirmed) { mpReferenceKF = seed; mCurrentFrame.mpReferenceKF = seed; }
+            handled = true;
+        }
+        WriteCornerEvent("SlamReloc.txt", "SLAM_SHORT_TRY frame=%lu ts=%.9f map=%lu seed=%lu age_s=%.6f gap_s=%.6f seed_added=%d extra_added=%d unique=%d cells=%d invalid=%d normalized_rmse=%.9f max_chi2=%.9f chi2_over=%d rotation_deg=%.6f translation_depth=%.9f anchor_rotation_deg=%.6f anchor_translation_depth=%.9f shared=%d streak=%d valid=%d confirmed=%d total_ms=%.3f previous_frame=%llu previous_points=%d",
+                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, map->GetId(), seed->mnId, age, gap, seed_added,
+                extra_added, q.unique, q.cells, q.invalid, q.normalized_rmse, q.max_chi2, q.chi2_over,
+                q.rotation_deg, q.translation_depth, anchor.rotation_deg, anchor.translation_depth, shared,
+                valid ? mCornerShortChain.streak : 0, valid ? 1 : 0, confirmed ? 1 : 0,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-began).count(),
+                static_cast<unsigned long long>(prior_frame), prior_points);
+        vector<string> lines;
+        AppendRecoveryResiduals(lines, "short", mCurrentFrame, q.unique, residuals);
+        WriteCornerEvents("SlamReloc.txt", lines);
+        if (!valid) { mCurrentFrame.copyFrom(original); ClearShortMapRecovery(); }
+        return confirmed;
+    }
+
+    bool Tracking::TryLocalTrackingFallback()
+    {
+        const double gap = mCurrentFrame.mTimeStamp - mLastFrame.mTimeStamp;
+        const int original_inliers = mFrameDiagnostics.local_inliers;
+        if (mbOnlyTracking || mState != OK || !mCurrentFrame.isSet() || !mLastFrame.isSet() ||
+            !LocalFallbackEligible(mSensor == System::MONOCULAR, mLastProcessedState == OK,
+                mCurrentFrame.mnId < mnLastRelocFrameId + mMaxFrames, original_inliers, gap, mCornerFallbackStreak))
+            return false;
+        Map* active_map = mpAtlas->GetCurrentMap();
+        KeyFrame* seed = mpLastKeyFrame;
+        if (!seed || seed->isBad() || seed->GetMap() != active_map) return false;
+        const auto began = std::chrono::steady_clock::now();
+        ++mCornerFallbackStreak;
+        mFrameDiagnostics.fallback_attempted = 1;
+        mFrameDiagnostics.fallback_original_inliers = original_inliers;
+        const auto saved_pose = mCurrentFrame.GetPose();
+        const auto saved_points = mCurrentFrame.mvpMapPoints;
+        const auto saved_outliers = mCurrentFrame.mvbOutlier;
+        unordered_set<unsigned long> old_inliers, unique;
+        set<MapPoint*> found;
+        for (size_t i = 0; i < mCurrentFrame.mvpMapPoints.size(); ++i)
+        {
+            MapPoint* point = mCurrentFrame.mvpMapPoints[i];
+            if (point && !mCurrentFrame.mvbOutlier[i] && !point->isBad() && point->Observations() > 0 &&
+                point->GetMap() == active_map && unique.insert(point->mnId).second)
+            { found.insert(point); old_inliers.insert(point->mnId); }
+            else mCurrentFrame.mvpMapPoints[i] = nullptr;
+            mCurrentFrame.mvbOutlier[i] = false;
+        }
+        vector<KeyFrame*> recent;
+        for (KeyFrame* keyframe : active_map->GetAllKeyFrames())
+        {
+            const double age = mCurrentFrame.mTimeStamp-keyframe->mTimeStamp;
+            if (!keyframe->isBad() && age >= 0 && age <= kRecoveryPoolRecentSeconds) recent.push_back(keyframe);
+        }
+        sort(recent.begin(), recent.end(), [](KeyFrame* a, KeyFrame* b) {
+            return a->mTimeStamp == b->mTimeStamp ? a->mnId > b->mnId : a->mTimeStamp > b->mTimeStamp;
+        });
+        auto pool = BuildRecoveryPool(seed, active_map, recent, mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, nullptr);
+        ORBmatcher matcher(.9, true);
+        const int seed_added = matcher.SearchByProjection(mCurrentFrame, seed, found, 10, 100);
+        found.clear();
+        for (MapPoint* point : mCurrentFrame.mvpMapPoints) if (point) found.insert(point);
+        RecoveryProjectionDiagnostics projection;
+        const int extra_added = matcher.SearchRecoveryPool(mCurrentFrame, pool.points, found, 10, 100, projection);
+        // A seed KF may itself contain repeated point associations. Never let
+        // these multiply the constraints submitted to the retry optimizer.
+        unique.clear();
+        for (auto& point : mCurrentFrame.mvpMapPoints)
+            if (point && !unique.insert(point->mnId).second) point = nullptr;
+        const int optimized = Optimizer::PoseOptimization(&mCurrentFrame);
+        const auto previous_pose = mLastFrame.GetPose();
+        vector<RecoveryResidual> residuals;
+        const auto quality = MeasureRecoveryQuality(mCurrentFrame, active_map, &previous_pose, &pool, &residuals);
+        const bool accepted = AcceptLocalFallback(quality);
+        WriteCornerEvent("SlamReloc.txt", "SLAM_LOCAL_FALLBACK_PROJ frame=%lu ts=%.9f tested=%d seed_excluded=%d already_found=%d invalid=%d depth=%d bounds=%d distance=%d no_features=%d no_free=%d descriptor=%d orientation=%d matched=%d",
+                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, projection.tested, projection.seed_excluded,
+                projection.already_found, projection.invalid, projection.depth, projection.bounds, projection.distance,
+                projection.no_features, projection.no_free, projection.descriptor, projection.orientation, projection.matched);
+        WriteCornerEvent("SlamReloc.txt", "SLAM_LOCAL_FALLBACK frame=%lu ts=%.9f map=%lu seed=%lu initial_inliers=%d frame_gap_s=%.6f streak=%d pool_points=%zu seed_added=%d extra_added=%d optimized=%d associations=%d unique=%d duplicates=%d invalid=%d cells=%d extra_inliers=%d rmse_px=%.6f median_px=%.6f p95_px=%.6f rotation_deg=%.6f translation_depth=%.9f accepted=%d total_ms=%.3f stage=before_recently_lost normalized_rmse=%.9f normalized_p95=%.9f max_chi2=%.9f chi2_over=%d quality_policy=octave_chi2",
+                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, active_map->GetId(), seed->mnId, original_inliers,
+                gap, mCornerFallbackStreak, pool.points.size(), seed_added, extra_added, optimized, quality.associations,
+                quality.unique, quality.duplicates, quality.invalid, quality.cells, quality.extra,
+                quality.rmse, quality.median, quality.p95, quality.rotation_deg, quality.translation_depth,
+                accepted ? 1 : 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-began).count(),
+                quality.normalized_rmse, quality.normalized_p95, quality.max_chi2, quality.chi2_over);
+        vector<string> residual_lines;
+        AppendRecoveryResiduals(residual_lines, "local", mCurrentFrame, quality.unique, residuals);
+        WriteCornerEvents("SlamReloc.txt", residual_lines);
+        if (!accepted)
+        {
+            mCurrentFrame.SetPose(saved_pose);
+            mCurrentFrame.mvpMapPoints = saved_points;
+            mCurrentFrame.mvbOutlier = saved_outliers;
+            return false;
+        }
+        mFrameDiagnostics.fallback_accepted = 1;
+        mnMatchesInliers = quality.unique;
+        mpLocalMapper->mnMatchesInliers = mnMatchesInliers;
+        mFrameDiagnostics.local_inliers = mnMatchesInliers;
+        mFrameDiagnostics.local_matches = 0;
+        mFrameDiagnostics.local_outliers = 0;
+        mFrameDiagnostics.recent_inliers = 0;
+        mFrameDiagnostics.local_ok = 1;
+        mFrameDiagnostics.inlier_cells = quality.cells;
+        mFrameDiagnostics.map_match_labels.assign(mCurrentFrame.N, 0);
+        for (size_t i = 0; i < mCurrentFrame.mvpMapPoints.size(); ++i)
+        {
+            MapPoint* point = mCurrentFrame.mvpMapPoints[i];
+            if (!point) continue;
+            ++mFrameDiagnostics.local_matches;
+            if (mCurrentFrame.mvbOutlier[i])
+            { ++mFrameDiagnostics.local_outliers; mFrameDiagnostics.map_match_labels[i] = 2; continue; }
+            mFrameDiagnostics.map_match_labels[i] = 1;
+            if (!old_inliers.count(point->mnId)) point->IncreaseFound();
+            point->mnLastFrameSeen = mCurrentFrame.mnId;
+            if (point->mDebugBirthTime >= 0 && mCurrentFrame.mTimeStamp-point->mDebugBirthTime <= 2.0)
+                ++mFrameDiagnostics.recent_inliers;
+        }
+        return true;
+    }
+
     bool Tracking::TrackLocalMap()
     {
+        const auto debugResult = [this](bool ok) {
+            mFrameDiagnostics.local_ok = ok ? 1 : 0;
+            return ok;
+        };
 
         // We have an estimation of the camera pose and some map points tracked in the frame.
         // We retrieve the local map and try to find matches to points in the local map.
         mTrackedFr++;
 
         UpdateLocalMap();
+        mFrameDiagnostics.local_points = static_cast<int>(mvpLocalMapPoints.size());
         SearchLocalPoints();
 
         // TOO check outliers before PO
@@ -2602,6 +3091,8 @@ namespace ORB_SLAM3
                     aux2++;
             }
 
+        mFrameDiagnostics.local_matches = aux1;
+        mFrameDiagnostics.local_outliers = aux2;
         mnMatchesInliers = 0;
 
         // Update MapPoints Statistics
@@ -2615,7 +3106,12 @@ namespace ORB_SLAM3
                     if (!mbOnlyTracking)
                     {
                         if (mCurrentFrame.mvpMapPoints[i]->Observations() > 0)
+                        {
                             mnMatchesInliers++;
+                            const double birth = mCurrentFrame.mvpMapPoints[i]->mDebugBirthTime;
+                            if (birth >= 0 && mCurrentFrame.mTimeStamp - birth <= 2.0)
+                                ++mFrameDiagnostics.recent_inliers;
+                        }
                     }
                     else
                         mnMatchesInliers++;
@@ -2626,39 +3122,57 @@ namespace ORB_SLAM3
         }
 
         // Decide if the tracking was succesful
+        mFrameDiagnostics.local_inliers = mnMatchesInliers;
+        mFrameDiagnostics.map_match_labels.assign(mCurrentFrame.N, 0);
+        for (int i = 0; i < mCurrentFrame.N; ++i)
+            if (mCurrentFrame.mvpMapPoints[i])
+                mFrameDiagnostics.map_match_labels[i] = mCurrentFrame.mvbOutlier[i] ? 2 :
+                        (mCurrentFrame.mvpMapPoints[i]->Observations() > 0 ? 1 : 0);
+        bool occupied[48] = {};
+        for (int i = 0; i < mCurrentFrame.N; ++i)
+        {
+            if (i >= static_cast<int>(mCurrentFrame.mvKeysUn.size())) continue;
+            if (!mCurrentFrame.mvpMapPoints[i] || mCurrentFrame.mvbOutlier[i]) continue;
+            const auto& point = mCurrentFrame.mvKeysUn[i].pt;
+            const int x = std::max(0, std::min(7, static_cast<int>(point.x * 8 / mImGray.cols)));
+            const int y = std::max(0, std::min(5, static_cast<int>(point.y * 6 / mImGray.rows)));
+            occupied[y * 8 + x] = true;
+        }
+        mFrameDiagnostics.inlier_cells = 0;
+        for (bool cell : occupied) if (cell) ++mFrameDiagnostics.inlier_cells;
         // More restrictive if there was a relocalization recently
         mpLocalMapper->mnMatchesInliers = mnMatchesInliers;
         if (mCurrentFrame.mnId < mnLastRelocFrameId + mMaxFrames && mnMatchesInliers < 50)
-            return false;
+            return debugResult(false);
 
-        if ((mnMatchesInliers > 10) && (mState == RECENTLY_LOST))
-            return true;
+        if ((mnMatchesInliers > 10) && (mState == RECENTLY_LOST) && !mFrameDiagnostics.short_confirmed)
+            return debugResult(true);
 
 
         if (mSensor == System::IMU_MONOCULAR)
         {
             if ((mnMatchesInliers < 15 && mpAtlas->isImuInitialized()) || (mnMatchesInliers < 50 && !mpAtlas->isImuInitialized()))
             {
-                return false;
+                return debugResult(false);
             }
             else
-                return true;
+                return debugResult(true);
         }
         else if (mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
         {
             if (mnMatchesInliers < 15)
             {
-                return false;
+                return debugResult(false);
             }
             else
-                return true;
+                return debugResult(true);
         }
         else
         {
             if (mnMatchesInliers < 30)
-                return false;
+                return debugResult(false);
             else
-                return true;
+                return debugResult(true);
         }
     }
 
@@ -2936,9 +3450,12 @@ namespace ORB_SLAM3
         mpLocalMapper->InsertKeyFrame(pKF);
 
         mpLocalMapper->SetNotStop(false);
+        mFrameDiagnostics.new_keyframe = 1;
 
         mnLastKeyFrameId = mCurrentFrame.mnId;
         mpLastKeyFrame = pKF;
+        WriteCornerEvent("SlamKeyframes.txt", "SLAM_KF_CREATE frame=%lu kf=%lu ts=%.9f map=%lu inliers=%d",
+                mCurrentFrame.mnId, pKF->mnId, pKF->mTimeStamp, pKF->GetMap()->GetId(), mnMatchesInliers);
     }
 
     void Tracking::SearchLocalPoints()
@@ -2970,22 +3487,36 @@ namespace ORB_SLAM3
         {
             MapPoint* pMP = *vit;
 
+            const bool recent = pMP->mDebugBirthTime >= 0 &&
+                    mCurrentFrame.mTimeStamp - pMP->mDebugBirthTime <= 2.0;
+            if (recent) ++mFrameDiagnostics.recent_points;
             if (pMP->mnLastFrameSeen == mCurrentFrame.mnId)
+            {
+                if (recent) ++mFrameDiagnostics.recent_preassociated;
                 continue;
+            }
             if (pMP->isBad())
                 continue;
             // Project (this fills MapPoint variables for matching)
-            if (mCurrentFrame.isInFrustum(pMP, 0.5))
+            int reason = 5;
+            ++mFrameDiagnostics.projection_tested;
+            if (recent) ++mFrameDiagnostics.recent_tested;
+            if (mCurrentFrame.isInFrustum(pMP, 0.5, &reason))
             {
                 pMP->IncreaseVisible();
                 nToMatch++;
+                if (recent) ++mFrameDiagnostics.recent_visible;
             }
+            ++mFrameDiagnostics.projection_rejected[reason];
+            if (recent) ++mFrameDiagnostics.recent_projection[reason];
             if (pMP->mbTrackInView)
             {
                 mCurrentFrame.mmProjectPoints[pMP->mnId] = cv::Point2f(pMP->mTrackProjX, pMP->mTrackProjY);
             }
         }
 
+        mFrameDiagnostics.local_visible = nToMatch;
+        mFrameDiagnostics.local_added = 0;
         if (nToMatch > 0)
         {
             ORBmatcher matcher(0.8);
@@ -3011,7 +3542,9 @@ namespace ORB_SLAM3
             if (mState == LOST || mState == RECENTLY_LOST) // Lost for less than 1 second
                 th = 15; // 15
 
-            int matches = matcher.SearchByProjection(mCurrentFrame, mvpLocalMapPoints, th, mpLocalMapper->mbFarPoints, mpLocalMapper->mThFarPoints);
+            int matches = matcher.SearchByProjection(mCurrentFrame, mvpLocalMapPoints, th, mpLocalMapper->mbFarPoints,
+                    mpLocalMapper->mThFarPoints, &mFrameDiagnostics.projection_match);
+            mFrameDiagnostics.local_added = matches;
         }
     }
 
@@ -3216,6 +3749,7 @@ namespace ORB_SLAM3
         // Relocalization is performed when tracking is lost
         // Track Lost: Query KeyFrame Database for keyframe candidates for relocalisation
         vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectRelocalizationCandidates(&mCurrentFrame, mpAtlas->GetCurrentMap());
+        mFrameDiagnostics.reloc_candidates = static_cast<int>(vpCandidateKFs.size());
 
         if (vpCandidateKFs.empty()) {
             Verbose::PrintMess("There are not candidates", Verbose::VERBOSITY_NORMAL);
@@ -3228,7 +3762,7 @@ namespace ORB_SLAM3
         // If enough matches are found we setup a PnP solver
         ORBmatcher matcher(0.75, true);
 
-        vector<MLPnPsolver*> vpMLPnPsolvers;
+        vector<unique_ptr<MLPnPsolver>> vpMLPnPsolvers;
         vpMLPnPsolvers.resize(nKFs);
 
         vector<vector<MapPoint*> > vvpMapPointMatches;
@@ -3237,16 +3771,38 @@ namespace ORB_SLAM3
         vector<bool> vbDiscarded;
         vbDiscarded.resize(nKFs);
 
+        struct SolverDiagnostics
+        {
+            int eligible = 0, attempts = 0, poses = 0, pnp_best = -1, initial_good_best = -1;
+            int coarse_calls = 0, coarse_added_best = -1, coarse_gate_best = -1, coarse_good_best = -1;
+            int fine_calls = 0, fine_added_best = -1, fine_gate_best = -1, final_good_best = -1, recovered = 0;
+            int pool_points = -1, extra_points = -1, pool_short = 0, expand_calls = 0, expand_budget_skips = 0;
+            int expand_added_best = -1, expand_gate_best = -1, extra_inliers_best = -1;
+            int quality_best = -1;
+            int short_opt_calls = 0;
+            double pnp_ms = 0, optimize_ms = 0;
+        };
+        vector<SolverDiagnostics> solver_diagnostics(nKFs);
+
         int nCandidates = 0;
 
         for (int i = 0; i < nKFs; i++)
         {
             KeyFrame* pKF = vpCandidateKFs[i];
+            if (i < 8)
+                WriteCornerEvent("SlamReloc.txt", "SLAM_RELOC_CANDIDATE frame=%lu ts=%.9f rank=%d kf=%lu kf_ts=%.9f age_s=%.6f bad=%d available_mps=%d common_words=%d score=%.6f",
+                        mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, i, pKF->mnId, pKF->mTimeStamp,
+                        mCurrentFrame.mTimeStamp - pKF->mTimeStamp, pKF->isBad() ? 1 : 0,
+                        pKF->TrackedMapPoints(1), pKF->mnRelocWords, pKF->mRelocScore);
             if (pKF->isBad())
                 vbDiscarded[i] = true;
             else
             {
                 int nmatches = matcher.SearchByBoW(pKF, mCurrentFrame, vvpMapPointMatches[i]);
+                mFrameDiagnostics.reloc_bow_best = std::max(mFrameDiagnostics.reloc_bow_best, nmatches);
+                if (i < 8)
+                    WriteCornerEvent("SlamReloc.txt", "SLAM_RELOC_BOW frame=%lu ts=%.9f kf=%lu matches=%d pnp_eligible=%d",
+                            mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, pKF->mnId, nmatches, nmatches >= 15 ? 1 : 0);
                 if (nmatches < 15)
                 {
                     vbDiscarded[i] = true;
@@ -3254,18 +3810,116 @@ namespace ORB_SLAM3
                 }
                 else
                 {
-                    MLPnPsolver* pSolver = new MLPnPsolver(mCurrentFrame, vvpMapPointMatches[i]);
+                    solver_diagnostics[i].eligible = 1;
+                    auto pSolver = make_unique<MLPnPsolver>(mCurrentFrame, vvpMapPointMatches[i]);
                     pSolver->SetRansacParameters(0.99, 10, 300, 6, 0.5, 5.991);  //This solver needs at least 6 points
-                    vpMLPnPsolvers[i] = pSolver;
+                    vpMLPnPsolvers[i] = std::move(pSolver);
                     nCandidates++;
                 }
             }
         }
 
+        const int debug_pnp_candidates = nCandidates;
         // Alternatively perform some iterations of P4P RANSAC
         // Until we found a camera pose supported by enough inliers
         bool bMatch = false;
         ORBmatcher matcher2(0.9, true);
+        const bool expand_enabled = mSensor == System::MONOCULAR;
+        Map* recovery_map = mpAtlas->GetCurrentMap();
+        vector<KeyFrame*> recent_keyframes;
+        if (expand_enabled && nCandidates > 0)
+        {
+            for (KeyFrame* keyframe : recovery_map->GetAllKeyFrames())
+            {
+                const double age = mCurrentFrame.mTimeStamp - keyframe->mTimeStamp;
+                if (!keyframe->isBad() && keyframe->GetMap() == recovery_map && age >= 0 && age <= kRecoveryPoolRecentSeconds)
+                    recent_keyframes.push_back(keyframe);
+            }
+            sort(recent_keyframes.begin(), recent_keyframes.end(), [](KeyFrame* a, KeyFrame* b) {
+                return a->mTimeStamp == b->mTimeStamp ? a->mnId > b->mnId : a->mTimeStamp > b->mTimeStamp;
+            });
+        }
+        vector<RecoveryPoolSnapshot> recovery_pools(nKFs);
+        vector<string> recovery_lines;
+        const bool short_query = CornerShortRecoveryEnabled() && expand_enabled && !mbOnlyTracking &&
+                mState == RECENTLY_LOST && mCornerLastGoodMap == recovery_map && mCornerLastGoodTime >= 0 &&
+                mCurrentFrame.mTimeStamp > mCornerLastGoodTime &&
+                mCurrentFrame.mTimeStamp-mCornerLastGoodTime <= kShortRecoveryWindow;
+        vector<vector<string>> quality_lines(nKFs);
+        int best_residual_count = -1, short_seed_unique = -1;
+        vector<RecoveryResidual> best_residuals;
+        vector<MapPoint*> short_seed_points;
+        vector<bool> short_seed_outliers;
+        Sophus::SE3f short_seed_pose;
+        KeyFrame* short_seed = nullptr;
+        RecoveryQuality short_seed_quality;
+        auto optimize_candidate = [&](int candidate, const char* stage) {
+            const auto began = std::chrono::steady_clock::now();
+            const int good = Optimizer::PoseOptimization(&mCurrentFrame);
+            auto& d = solver_diagnostics[candidate];
+            d.optimize_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-began).count();
+            if (candidate < 8 && good > d.quality_best)
+            {
+                d.quality_best = good;
+                const bool has_reference = mCornerLastGoodTime >= 0 && mCornerLastGoodMap == recovery_map &&
+                        mCornerLastGoodTime <= mCurrentFrame.mTimeStamp;
+                vector<RecoveryResidual> residuals;
+                const auto q = MeasureRecoveryQuality(mCurrentFrame, recovery_map,
+                        has_reference ? &mCornerLastGoodPose : nullptr, &recovery_pools[candidate], &residuals);
+                if (q.unique > best_residual_count) { best_residual_count = q.unique; best_residuals = residuals; }
+                const double reference_age = has_reference ? mCurrentFrame.mTimeStamp-mCornerLastGoodTime : -1;
+                const double seed_age = mCurrentFrame.mTimeStamp-vpCandidateKFs[candidate]->mTimeStamp;
+                if (CornerShortRecoveryEnabled() && expand_enabled && !mbOnlyTracking && mState == RECENTLY_LOST &&
+                    seed_age >= 0 && seed_age <= kRecoveryPoolRecentSeconds && q.unique < 50 &&
+                    AcceptShortAnchor(q, reference_age) && q.unique > short_seed_unique)
+                {
+                    short_seed_unique = q.unique; short_seed = vpCandidateKFs[candidate]; short_seed_quality = q;
+                    short_seed_pose = mCurrentFrame.GetPose(); short_seed_points = mCurrentFrame.mvpMapPoints;
+                    short_seed_outliers = mCurrentFrame.mvbOutlier;
+                }
+                auto& lines = quality_lines[candidate];
+                lines.clear();
+                AppendCornerEvent(lines, "SLAM_RELOC_QUALITY frame=%lu ts=%.9f seed=%lu stage=%s optimized_inliers=%d associations=%d unique=%d duplicates=%d invalid=%d cells=%d extra_inliers=%d rmse_px=%.6f median_px=%.6f p95_px=%.6f rotation_deg=%.6f translation_depth=%.9f reference_age_s=%.6f decision=diagnostic_only normalized_rmse=%.9f normalized_p95=%.9f max_chi2=%.9f chi2_over=%d quality_policy=octave_chi2",
+                        mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, vpCandidateKFs[candidate]->mnId, stage,
+                        good, q.associations, q.unique, q.duplicates, q.invalid, q.cells, q.extra,
+                        q.rmse, q.median, q.p95, q.rotation_deg, q.translation_depth,
+                        reference_age, q.normalized_rmse, q.normalized_p95, q.max_chi2, q.chi2_over);
+            }
+            return good;
+        };
+        auto expand_projection = [&](int candidate, const char* stage, int existing_good, int seed_added,
+                float radius, int descriptor_limit) {
+            auto& debug = solver_diagnostics[candidate];
+            if (!expand_enabled || candidate >= kRecoveryPoolCandidateLimit || existing_good + seed_added >= 50) return 0;
+            if (debug.expand_calls >= kRecoveryPoolMaxExpansions) { ++debug.expand_budget_skips; return 0; }
+            auto& pool = recovery_pools[candidate];
+            if (!pool.built)
+            {
+                pool = BuildRecoveryPool(vpCandidateKFs[candidate], recovery_map, recent_keyframes,
+                        mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, candidate < 8 ? &recovery_lines : nullptr);
+                debug.pool_points = static_cast<int>(pool.points.size());
+                debug.extra_points = static_cast<int>(pool.extra_ids.size());
+            }
+            if (pool.points.size() < 50) { debug.pool_short = 1; return 0; }
+            set<MapPoint*> found;
+            for (MapPoint* point : mCurrentFrame.mvpMapPoints) if (point) found.insert(point);
+            RecoveryProjectionDiagnostics projection;
+            const auto began = std::chrono::steady_clock::now();
+            const int added = matcher2.SearchRecoveryPool(mCurrentFrame, pool.points, found, radius, descriptor_limit, projection);
+            ++debug.expand_calls;
+            debug.expand_added_best = std::max(debug.expand_added_best, added);
+            debug.expand_gate_best = std::max(debug.expand_gate_best, existing_good + seed_added + added);
+            if (candidate < 8)
+                AppendCornerEvent(recovery_lines, "SLAM_RELOC_EXPAND frame=%lu ts=%.9f seed=%lu stage=%s round=%d seed_good=%d seed_added=%d baseline_total=%d extra_added=%d total_matches=%d required=50 tested=%d seed_excluded=%d already_found=%d invalid=%d depth=%d bounds=%d distance=%d no_features=%d no_free=%d descriptor=%d orientation=%d matched=%d search_ms=%.3f",
+                        mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, vpCandidateKFs[candidate]->mnId,
+                        stage, debug.expand_calls, existing_good, seed_added, existing_good + seed_added,
+                        added, existing_good + seed_added + added, projection.tested, projection.seed_excluded,
+                        projection.already_found, projection.invalid, projection.depth, projection.bounds,
+                        projection.distance, projection.no_features, projection.no_free, projection.descriptor,
+                        projection.orientation, projection.matched,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
+            return added;
+        };
 
         while (nCandidates > 0 && !bMatch)
         {
@@ -3279,9 +3933,13 @@ namespace ORB_SLAM3
                 int nInliers;
                 bool bNoMore;
 
-                MLPnPsolver* pSolver = vpMLPnPsolvers[i];
+                MLPnPsolver* pSolver = vpMLPnPsolvers[i].get();
+                auto& solver_debug = solver_diagnostics[i];
+                ++solver_debug.attempts;
                 Eigen::Matrix4f eigTcw;
+                const auto pnp_start = std::chrono::steady_clock::now();
                 bool bTcw = pSolver->iterate(5, bNoMore, vbInliers, nInliers, eigTcw);
+                solver_debug.pnp_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-pnp_start).count();
 
                 // If Ransac reachs max. iterations discard keyframe
                 if (bNoMore)
@@ -3293,6 +3951,8 @@ namespace ORB_SLAM3
                 // If a Camera Pose is computed, optimize
                 if (bTcw)
                 {
+                    ++solver_debug.poses;
+                    solver_debug.pnp_best = std::max(solver_debug.pnp_best, nInliers);
                     Sophus::SE3f Tcw(eigTcw);
                     mCurrentFrame.SetPose(Tcw);
                     // Tcw.copyTo(mCurrentFrame.mTcw);
@@ -3312,7 +3972,9 @@ namespace ORB_SLAM3
                             mCurrentFrame.mvpMapPoints[j] = NULL;
                     }
 
-                    int nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+                    int nGood = optimize_candidate(i, "initial");
+                    solver_debug.initial_good_best = std::max(solver_debug.initial_good_best, nGood);
+                    mFrameDiagnostics.reloc_good_best = std::max(mFrameDiagnostics.reloc_good_best, nGood);
 
                     if (nGood < 10)
                         continue;
@@ -3325,10 +3987,18 @@ namespace ORB_SLAM3
                     if (nGood < 50)
                     {
                         int nadditional = matcher2.SearchByProjection(mCurrentFrame, vpCandidateKFs[i], sFound, 10, 100);
+                        nadditional += expand_projection(i, "coarse", nGood, nadditional, 10, 100);
+                        ++solver_debug.coarse_calls;
+                        solver_debug.coarse_added_best = std::max(solver_debug.coarse_added_best, nadditional);
+                        solver_debug.coarse_gate_best = std::max(solver_debug.coarse_gate_best, nadditional + nGood);
 
-                        if (nadditional + nGood >= 50)
+                        if (AllowRecoveryOptimization(nadditional+nGood, short_query, solver_debug.short_opt_calls))
                         {
-                            nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+                            nGood = optimize_candidate(i, "coarse");
+                            if (recovery_pools[i].built)
+                                solver_debug.extra_inliers_best = std::max(solver_debug.extra_inliers_best,
+                                        CountRecoveryExtraInliers(mCurrentFrame, recovery_pools[i]));
+                            solver_debug.coarse_good_best = std::max(solver_debug.coarse_good_best, nGood);
 
                             // If many inliers but still not enough, search by projection again in a narrower window
                             // the camera has been already optimized with many points
@@ -3339,11 +4009,18 @@ namespace ORB_SLAM3
                                     if (mCurrentFrame.mvpMapPoints[ip])
                                         sFound.insert(mCurrentFrame.mvpMapPoints[ip]);
                                 nadditional = matcher2.SearchByProjection(mCurrentFrame, vpCandidateKFs[i], sFound, 3, 64);
+                                nadditional += expand_projection(i, "fine", nGood, nadditional, 3, 64);
+                                ++solver_debug.fine_calls;
+                                solver_debug.fine_added_best = std::max(solver_debug.fine_added_best, nadditional);
+                                solver_debug.fine_gate_best = std::max(solver_debug.fine_gate_best, nGood + nadditional);
 
                                 // Final optimization
-                                if (nGood + nadditional >= 50)
+                                if (AllowRecoveryOptimization(nGood+nadditional, short_query, solver_debug.short_opt_calls))
                                 {
-                                    nGood = Optimizer::PoseOptimization(&mCurrentFrame);
+                                    nGood = optimize_candidate(i, "fine");
+                                    if (recovery_pools[i].built)
+                                        solver_debug.extra_inliers_best = std::max(solver_debug.extra_inliers_best,
+                                                CountRecoveryExtraInliers(mCurrentFrame, recovery_pools[i]));
 
                                     for (int io = 0; io < mCurrentFrame.N; io++)
                                         if (mCurrentFrame.mvbOutlier[io])
@@ -3354,9 +4031,14 @@ namespace ORB_SLAM3
                     }
 
 
+                    solver_debug.final_good_best = std::max(solver_debug.final_good_best, nGood);
+                    mFrameDiagnostics.reloc_good_best = std::max(mFrameDiagnostics.reloc_good_best, nGood);
                     // If the pose is supported by enough inliers stop ransacs and continue
                     if (nGood >= 50)
                     {
+                        solver_debug.recovered = 1;
+                        if (expand_enabled)
+                            LogRecoveryVerification(mCurrentFrame, vpCandidateKFs[i], recovery_pools[i], nGood, recovery_lines);
                         bMatch = true;
                         break;
                     }
@@ -3364,12 +4046,62 @@ namespace ORB_SLAM3
             }
         }
 
+        WriteCornerEvents("SlamReloc.txt", recovery_lines);
+        vector<string> solver_lines;
+        if (best_residual_count >= 0)
+            AppendRecoveryResiduals(solver_lines, "reloc", mCurrentFrame, best_residual_count, best_residuals);
+        for (int i = 0; i < nKFs && i < 8; ++i)
+        {
+            const auto& d = solver_diagnostics[i];
+            for (const auto& line : quality_lines[i]) solver_lines.push_back(line);
+            if (vpMLPnPsolvers[i])
+            {
+                const auto& p = vpMLPnPsolvers[i]->GetDiagnostics();
+                AppendCornerEvent(solver_lines, "SLAM_PNP frame=%lu ts=%.9f seed=%lu calls=%d samples=%d last_samples=%d limit=%d inputs=%d invalid_inputs=%d duplicate_inputs=%d invalid_poses=%d refine_calls=%d refined=%d depth_rejected=%d exhausted=%d reason=%s batch_limit=5 sample_size=6 pnp_ms=%.3f optimize_ms=%.3f",
+                        mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, vpCandidateKFs[i]->mnId,
+                        p.calls, p.samples, p.last_samples, p.limit, p.inputs, p.invalid_inputs, p.duplicate_inputs,
+                        p.invalid_poses, p.refine_calls, p.refined, p.depth_rejected, p.exhausted ? 1 : 0,
+                        p.reason, d.pnp_ms, d.optimize_ms);
+            }
+            AppendCornerEvent(solver_lines, "SLAM_RELOC_SOLVER frame=%lu ts=%.9f kf=%lu eligible=%d pnp_attempts=%d pnp_poses=%d pnp_inliers_best=%d initial_good_best=%d coarse_calls=%d coarse_added_best=%d coarse_gate_best=%d coarse_good_best=%d fine_calls=%d fine_added_best=%d fine_gate_best=%d final_good_best=%d required_good=50 recovered=%d pool_points=%d extra_points=%d pool_short=%d expand_calls=%d expand_budget_skips=%d expand_added_best=%d expand_gate_best=%d extra_inliers_best=%d short_opt_calls=%d short_opt_budget=%d",
+                    mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, vpCandidateKFs[i]->mnId,
+                    d.eligible, d.attempts, d.poses, d.pnp_best, d.initial_good_best,
+                    d.coarse_calls, d.coarse_added_best, d.coarse_gate_best, d.coarse_good_best,
+                    d.fine_calls, d.fine_added_best, d.fine_gate_best, d.final_good_best, d.recovered,
+                    d.pool_points, d.extra_points, d.pool_short, d.expand_calls, d.expand_budget_skips,
+                    d.expand_added_best, d.expand_gate_best, d.extra_inliers_best, d.short_opt_calls, kShortOptimizationBudget);
+        }
+        WriteCornerEvents("SlamReloc.txt", solver_lines);
+        WriteCornerEvent("SlamReloc.txt", "SLAM_RELOC_RESULT frame=%lu ts=%.9f candidates=%d pnp_candidates=%d best_bow=%d best_good=%d recovered=%d",
+                mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, nKFs, debug_pnp_candidates,
+                mFrameDiagnostics.reloc_bow_best, mFrameDiagnostics.reloc_good_best, bMatch ? 1 : 0);
         if (!bMatch)
         {
+            if (short_seed)
+            {
+                mCurrentFrame.SetPose(short_seed_pose);
+                mCurrentFrame.mvpMapPoints = short_seed_points;
+                mCurrentFrame.mvbOutlier = short_seed_outliers;
+                DeduplicateRecoveryFrame(mCurrentFrame);
+                for (size_t j = 0; j < mCurrentFrame.mvpMapPoints.size(); ++j)
+                    if (mCurrentFrame.mvbOutlier[j]) mCurrentFrame.mvpMapPoints[j] = nullptr;
+                mCornerShortFrame = make_unique<Frame>();
+                mCornerShortFrame->copyFrom(mCurrentFrame);
+                mCornerShortFrame->mpReferenceKF = short_seed;
+                mCornerShortChain.Reset();
+                mCornerShortChain.Observe(recovery_map->GetId(), mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, short_seed_unique, 0);
+                mFrameDiagnostics.short_pending = 1;
+                WriteCornerEvent("SlamReloc.txt", "SLAM_SHORT_SEED frame=%lu ts=%.9f map=%lu seed=%lu unique=%d cells=%d invalid=%d normalized_rmse=%.9f max_chi2=%.9f chi2_over=%d rotation_deg=%.6f translation_depth=%.9f age_s=%.6f streak=1 confirmed=0",
+                        mCurrentFrame.mnId, mCurrentFrame.mTimeStamp, recovery_map->GetId(), short_seed->mnId,
+                        short_seed_unique, short_seed_quality.cells, short_seed_quality.invalid, short_seed_quality.normalized_rmse,
+                        short_seed_quality.max_chi2, short_seed_quality.chi2_over, short_seed_quality.rotation_deg,
+                        short_seed_quality.translation_depth, mCurrentFrame.mTimeStamp-mCornerLastGoodTime);
+            }
             return false;
         }
         else
         {
+            ClearShortMapRecovery();
             mnLastRelocFrameId = mCurrentFrame.mnId;
             cout << "Relocalized!!" << endl;
             return true;
@@ -3379,6 +4111,11 @@ namespace ORB_SLAM3
 
     void Tracking::Reset(bool bLocMap)
     {
+        ClearShortMapRecovery();
+        mCornerLastGoodTime = -1;
+        mCornerLastGoodMap = nullptr;
+        mCornerFallbackStreak = 0;
+        __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG", "SLAM_EVENT type=reset_all");
         Verbose::PrintMess("System Reseting", Verbose::VERBOSITY_NORMAL);
 
         // Reset Local Mapping
@@ -3432,6 +4169,11 @@ namespace ORB_SLAM3
 
     void Tracking::ResetActiveMap(bool bLocMap)
     {
+        ClearShortMapRecovery();
+        mCornerLastGoodTime = -1;
+        mCornerLastGoodMap = nullptr;
+        mCornerFallbackStreak = 0;
+        __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG", "SLAM_EVENT type=reset_active_map");
         Verbose::PrintMess("Active map Reseting", Verbose::VERBOSITY_NORMAL);
 
         Map* pMap = mpAtlas->GetCurrentMap();

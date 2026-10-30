@@ -71,6 +71,16 @@ namespace ORB_SLAM3{
 
         bool iterate(int nIterations, bool &bNoMore, vector<bool> &vbInliers, int &nInliers, Eigen::Matrix4f &Tout);
 
+        struct Diagnostics
+        {
+            int calls = 0, samples = 0, last_samples = 0, limit = 0, inputs = 0;
+            int invalid_inputs = 0, duplicate_inputs = 0, invalid_poses = 0;
+            int refine_calls = 0, refined = 0, depth_rejected = 0;
+            bool exhausted = false;
+            const char* reason = "not_called";
+        };
+        const Diagnostics& GetDiagnostics() const { return mDiagnostics; }
+
         //Type definitions needed by the original code
 
         /** A 3-vector of unit length used to describe landmark observations/bearings
@@ -125,6 +135,8 @@ namespace ORB_SLAM3{
 
 
     private:
+        friend struct MLPnPSolverTestAccess;
+        Diagnostics mDiagnostics;
         void CheckInliers();
         bool Refine();
 

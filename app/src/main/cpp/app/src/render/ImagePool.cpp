@@ -1,4 +1,5 @@
 #include "render/ImagePool.h"
+#include <chrono>
 
 namespace android_slam
 {
@@ -57,12 +58,24 @@ namespace android_slam
 
     Image ImagePool::getImage()
     {
+        // acquireLatestImage can return no new image; SensorCamera then returns
+        // its previous buffer. Never send that exposure to SLAM a second time.
+        AImage* a_image = m_sensor_camera.getLatestImage();
+        int64_t time_stamp = 0;
+        if (!a_image || AImage_getTimestamp(a_image, &time_stamp) != AMEDIA_OK)
+            return Image{};
+        if (time_stamp <= m_last_timestamp)
+        {
+            if (time_stamp == m_last_timestamp) ++m_duplicate_polls;
+            else ++m_backward_images;
+            return Image{};
+        }
+        const auto readback_start = std::chrono::steady_clock::now();
         glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
         glViewport(0, 0, m_width, m_height);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
         // Paint to framebuffer
-        AImage* a_image = m_sensor_camera.getLatestImage();
         {
             m_transform_texture.setImage(a_image);
 
@@ -88,10 +101,13 @@ namespace android_slam
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 
-        int64_t time_stamp;
-        assert(AImage_getTimestamp(a_image, &time_stamp) == AMEDIA_OK);
-
-        return Image{ std::move(img), time_stamp };
+        m_last_timestamp = time_stamp;
+        Image result{ std::move(img), time_stamp };
+        result.readback_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - readback_start).count();
+        result.duplicate_polls = m_duplicate_polls;
+        result.backward_images = m_backward_images;
+        return result;
     }
 
 }

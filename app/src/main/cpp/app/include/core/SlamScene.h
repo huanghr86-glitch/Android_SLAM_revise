@@ -90,6 +90,7 @@ namespace android_slam
 
         // 实验日志帧号
         int m_log_frame_index = 0;
+        int m_debug_turn_index = 0;
 
     };
 

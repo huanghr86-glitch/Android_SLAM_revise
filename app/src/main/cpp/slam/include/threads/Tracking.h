@@ -33,6 +33,8 @@
 #include "feature/ORBextractor.h"
 #include "utils/ImuTypes.h"
 #include "utils/Settings.h"
+#include "utils/CornerDiagnostics.h"
+#include "utils/RecoveryValidation.h"
 
 #include "camera_models/GeometricCamera.h"
 
@@ -57,6 +59,35 @@ namespace ORB_SLAM3
 
     public:
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+        // Updated only by the tracking thread. -1 means the stage was not run.
+        struct FrameDiagnostics
+        {
+            unsigned long frame_id = 0;
+            int keypoints = 0;
+            int keypoint_cells = 0, inlier_cells = -1;
+            int motion_raw = -1, motion_wide = -1, motion_inliers = -1;
+            int ref_raw = -1, ref_inliers = -1;
+            int local_points = -1, local_visible = -1, local_added = -1;
+            int local_matches = -1, local_outliers = -1, local_inliers = -1;
+            int reloc_candidates = -1, reloc_bow_best = -1, reloc_good_best = -1;
+            int local_ok = -1, new_keyframe = 0;
+            int fallback_attempted = 0, fallback_accepted = 0, fallback_original_inliers = -1;
+            int short_pending = 0, short_confirmed = 0, short_final_ok = -1;
+            int projection_tested = 0, projection_rejected[6] = {};
+            int recent_projection[6] = {};
+            int recent_points = 0, recent_preassociated = 0, recent_tested = 0, recent_visible = 0;
+            int recent_inliers = 0;
+            ProjectionMatchDiagnostics projection_match;
+            long ref_kf = -1, last_kf = -1;
+            int ref_in_db = -1, last_in_db = -1, db_map_kfs = -1;
+            long db_newest_kf = -1;
+            double db_newest_age_s = -1;
+            std::vector<unsigned char> map_match_labels; // 0 unassociated, 1 inlier, 2 outlier
+            double lost_s = 0.0;
+            const char* event = "none";
+        };
+        const FrameDiagnostics& GetFrameDiagnostics() const { return mFrameDiagnostics; }
 
         Tracking(
         System* pSys, ORBVocabulary* pVoc, Atlas* pAtlas, KeyFrameDatabase* pKFDB, const string& strSettingPath, const int sensor, Settings* settings, const string& _nameSeq = std::string());
@@ -182,6 +213,18 @@ namespace ORB_SLAM3
         bool mbWriteStats;
 
     protected:
+
+        FrameDiagnostics mFrameDiagnostics;
+        int mCornerFallbackStreak = 0;
+        Sophus::SE3f mCornerLastGoodPose;
+        double mCornerLastGoodTime = -1;
+        Map* mCornerLastGoodMap = nullptr;
+        bool TryLocalTrackingFallback();
+        bool TryShortMapRecovery(bool& handled);
+        void ClearShortMapRecovery();
+        ShortRecoveryChain mCornerShortChain;
+        std::unique_ptr<Frame> mCornerShortFrame;
+        Sophus::SE3f mCornerShortPreviousPose;
 
         // Main tracking function. It is independent of the input sensor.
         void Track();

@@ -117,7 +117,9 @@ public:
 
     // Check if a MapPoint is in the frustum of the camera
     // and fill variables of the MapPoint to be used by the tracking
-    bool isInFrustum(MapPoint* pMP, float viewingCosLimit);
+    // reason: 0 visible, 1 depth, 2 image bounds, 3 distance,
+    // 4 viewing angle, 5 other/stereo. Optional diagnostic output only.
+    bool isInFrustum(MapPoint* pMP, float viewingCosLimit, int* reason = nullptr);
 
     bool ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v);
 

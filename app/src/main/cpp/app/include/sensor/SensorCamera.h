@@ -62,6 +62,7 @@ namespace android_slam
 
         ACameraDevice_StateCallbacks m_camera_device_state_callbacks;
         ACameraCaptureSession_stateCallbacks m_capture_session_state_callbacks;
+        ACameraCaptureSession_captureCallbacks m_capture_callbacks{};
     };
 
 }

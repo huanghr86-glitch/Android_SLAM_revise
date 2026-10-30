@@ -7,6 +7,9 @@ project(android_slam)
     file(GLOB sensor_files CONFIGURE_DEPENDS ./include/sensor/*.h ./src/sensor/*.cpp)
     file(GLOB utils_files  CONFIGURE_DEPENDS ./include/utils/*.h ./src/utils/*.cpp)
 
+    # Invalid sensor values must remain detectable despite the app's -ffast-math.
+    set_source_files_properties(src/sensor/SensorGnss.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+
     add_library(${PROJECT_NAME} SHARED
         ${core_files}
         ${render_files}

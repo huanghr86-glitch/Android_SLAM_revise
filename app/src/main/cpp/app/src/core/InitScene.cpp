@@ -6,6 +6,7 @@
 
 #include "utils/AssetManager.h"
 #include "utils/ImageLoader.h"
+#include "utils/GnssGui.h"
 
 namespace android_slam
 {
@@ -58,6 +59,7 @@ namespace android_slam
 
     void InitScene::drawGui(float dt)
     {
+        drawGnssPanel();
         if (ImGui::Button(m_initialized ? u8"继续SLAM跟踪" : "开始SLAM跟踪"))
         {
             m_initialized = true;

@@ -9,6 +9,7 @@
 #include "utils/Log.h"
 #include "utils/AssetManager.h"
 #include "utils/ImageLoader.h"
+#include "utils/GnssGui.h"
 #include <cstdio>
 #include <sstream>
 
@@ -17,6 +18,10 @@ namespace android_slam
 
     void SlamScene::init()
     {
+        m_need_update_image = true;
+        tracking_res = TrackingResult{};
+        m_tracking_result = TrackingResult{};
+        m_comm_has_new_data = false;
         m_file_manager = std::make_unique<AssetManager>();
 
         Image first_image;
@@ -83,6 +88,9 @@ namespace android_slam
         // 每次开启新实验时覆盖旧日志，避免文件随实验次数持续膨胀。
         m_file_manager->clearFile("/storage/emulated/0/Documents/SlamLog.txt");
         AssetManager::appendLog("========== SLAM session start ==========");
+        AssetManager::appendLog("debug_version=corner_diag_v6 mode=MONOCULAR imu_fused=0 unique_images_only=1 recovery_policy=expanded_projection_pool reloc_score_policy=current_query_only pnp_policy=bounded_refine_applied fallback_policy=one_wide_local_retry quality_policy=octave_chi2");
+        m_log_frame_index = 0;
+        m_debug_turn_index = 0;
 
         // Create slam thread.
         m_slam_thread = std::make_unique<std::thread>(
@@ -105,15 +113,19 @@ namespace android_slam
                     // Call slam tracking function.
                     //auto res = m_slam_kernel->handleData(images, imu_points);
                     auto res = m_slam_kernel->handleData(images, {});
-                    m_slam_has_new_data = false; // This image is processed and this thread needs new image.
 
                     // Synchronize tracking result to main thread, move the data because this thread doesn't need it.
                     {
                         std::unique_lock<std::mutex> lock(m_tracking_res_mutex);
                         m_tracking_result = std::move(res);
                     }
+                    // Publish the result before allowing the producer to submit
+                    // another image. This keeps diagnostic results in order.
+                    m_slam_has_new_data = false;
 
                 }
+                else
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
         );
@@ -207,17 +219,29 @@ namespace android_slam
         // Update image data if not paused and slam thread needs new image. Render data will be set at the same time.
         if (m_need_update_image && !m_slam_has_new_data)
         {
+            bool has_result = false;
+            {
+                std::unique_lock<std::mutex> lock(m_tracking_res_mutex);
+                if (!m_tracking_result.tracking_status.empty())
+                {
+                    tracking_res = std::move(m_tracking_result);
+                    m_tracking_result = TrackingResult{};
+                    has_result = true;
+                }
+            }
+
             // Slam handling.
             std::vector<Image> images;
             //std::vector<ImuPoint> imus;
             if(!m_from_datasets) {
                 images.push_back(m_image_pool->getImage());
+                if (!images[0].data.empty())
                 {
                     std::unique_lock<std::mutex> lock(m_image_mutex);
                     m_images = images;
                     //m_imu_points = m_imu_pool->getImuData();
+                    m_slam_has_new_data = true;
                 }
-                m_slam_has_new_data = true;
             }
             else{// outline dataset
                 {
@@ -233,22 +257,15 @@ namespace android_slam
                 }
                 m_slam_has_new_data = true;
             }
-            //TrackingResult tracking_res;
-            {
-                std::unique_lock<std::mutex> lock(m_tracking_res_mutex);
-                tracking_res = std::move(m_tracking_result);
-            }
-            DEBUG_INFO("[Android Slam App Info] Current tracking state: %s", tracking_res.tracking_status.c_str());
-
             // Set slam data.
-            m_slam_renderer->setImage(k_sensor_camera_width, k_sensor_camera_height, images[0]);
-            m_slam_renderer->setData(tracking_res);
-
-            m_app_ref.m_last_process_delta_time = tracking_res.processing_delta_time;
+            if (!images[0].data.empty())
+                m_slam_renderer->setImage(k_sensor_camera_width, k_sensor_camera_height, images[0]);
 
             // 实验日志：打印并写入 /storage/emulated/0/Documents/SlamLog.txt
-            if (!tracking_res.tracking_status.empty())
+            if (has_result)
             {
+                m_slam_renderer->setData(tracking_res);
+                m_app_ref.m_last_process_delta_time = tracking_res.processing_delta_time;
                 float px = 0.0f, py = 0.0f, pz = 0.0f;
                 if (!tracking_res.trajectory.empty())
                 {
@@ -258,7 +275,7 @@ namespace android_slam
                 }
                 char line[256];
                 snprintf(line, sizeof(line),
-                         "frame=%d ts=%lld state=%s dt=%.4f scale=%.4f pos=(%.4f,%.4f,%.4f) traj=%lu mp=%lu",
+                         "frame=%d ts=%lld state=%s dt=%.4f scale=%.4f pos=(%.4f,%.4f,%.4f) traj=%lu mp=%lu valid=%d",
                          m_log_frame_index++,
                          (long long) tracking_res.time_stamp,
                          tracking_res.tracking_status.c_str(),
@@ -266,7 +283,7 @@ namespace android_slam
                          m_slam_kernel->getSimScale(),
                          px, py, pz,
                          (unsigned long) tracking_res.trajectory.size(),
-                         (unsigned long) tracking_res.map_points.size());
+                         (unsigned long) tracking_res.map_points.size(), tracking_res.pose_valid ? 1 : 0);
                 DEBUG_INFO("[Android Slam App Info] %s", line);
                 AssetManager::appendLog(line);
             }
@@ -274,15 +291,15 @@ namespace android_slam
             //m_file_manager->getTraj(tracking_res);
 
             //set comm data
-            if(!m_comm_has_new_data)
+            if(has_result && !m_comm_has_new_data)
             {
                 {
                     std::unique_lock<std::mutex> lock(m_comm_mutex);
                     //m_comm_result = std::move(tracking_res);
                     m_comm_result = tracking_res;
                 }
+                m_comm_has_new_data = true;
             }
-            m_comm_has_new_data = true;
         }
 
         // Draw trajectory.
@@ -303,14 +320,36 @@ namespace android_slam
 
     void SlamScene::drawGui(float dt)
     {
+        drawGnssPanel();
         if (ImGui::TreeNode(u8"SLAM控制"))
         {
+            ImGui::Text("Diagnostics: corner_diag_v6");
             //auto pos = m_slam_renderer->temp_last_kf_position;
             //ImGui::Text("Position: (%f, %f, %f)", pos.x, pos.y, pos.z);
 
             if (ImGui::Button(m_need_update_image ? u8"暂停" : u8"继续"))
             {
                 m_need_update_image = !m_need_update_image;
+            }
+
+            if (ImGui::Button(u8"转弯开始"))
+            {
+                char marker[160];
+                snprintf(marker, sizeof(marker), "SLAM_MARK type=turn_start turn=%d ts=%lld state=%s",
+                        ++m_debug_turn_index, (long long)tracking_res.time_stamp,
+                        tracking_res.tracking_status.c_str());
+                AssetManager::appendLog(marker);
+                __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG", "%s", marker);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(u8"转弯结束"))
+            {
+                char marker[160];
+                snprintf(marker, sizeof(marker), "SLAM_MARK type=turn_end turn=%d ts=%lld state=%s",
+                        m_debug_turn_index, (long long)tracking_res.time_stamp,
+                        tracking_res.tracking_status.c_str());
+                AssetManager::appendLog(marker);
+                __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG", "%s", marker);
             }
 
             //if (ImGui::Button(u8"重置"))

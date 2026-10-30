@@ -4,6 +4,8 @@
 #include <vector>
 #include <tuple>
 #include <array>
+#include <cstdio>
+#include <future>
 
 #include <sophus/se3.hpp>
 #include <opencv2/core/core.hpp>
@@ -24,7 +26,10 @@ namespace android_slam
     struct Image
     {
         std::vector<uint8_t> data;
-        int64_t time_stamp;
+        int64_t time_stamp = 0;
+        double readback_ms = 0.0;
+        uint64_t duplicate_polls = 0;
+        uint64_t backward_images = 0;
     };
 
     struct ImuPoint
@@ -39,9 +44,10 @@ namespace android_slam
     };
 
     // 坐标契约（GNSS 融合前固化）：
-    //   内部 SLAM/世界: (x=east, y=up, z=north)
-    //   输出(PC/文件):  (x=east, y=north, z=up)  —— 即内部 y/z 交换
-    //   GNSS 的 ENU:   (east, north, up)
+    //   raw SLAM: 原点、方向和单目尺度由初始化确定，尚无地理意义。
+    //   现有对齐目标/显示轴序: (east, up, north)
+    //   输出(PC/文件): 交换内部 y/z；只有完成地理对齐后才可解释为 ENU。
+    //   GNSS 的 ENU: (east, north, up)，右手系、米；融合数学在 ENU 中完成。
     struct TrackingResult
     {
         struct Pos
@@ -51,13 +57,14 @@ namespace android_slam
             float z;
         };
 
-        std::array<float, 16> last_pose;
+        std::array<float, 16> last_pose{};
         int64_t time_stamp = 0;   // 该帧相机时间戳(单调纳秒)，用于与 GNSS 对齐
         std::vector<Pos> trajectory;
         std::vector<Pos> map_points;
         std::string tracking_status;
 
-        float processing_delta_time;
+        float processing_delta_time = 0.0f;
+        bool pose_valid = false;
     };
 
     // 内部坐标 -> 输出坐标: (east, up, north) -> (east, north, up)
@@ -66,7 +73,7 @@ namespace android_slam
         return TrackingResult::Pos{ p.x, p.z, p.y };
     }
 
-    // GNSS 的 ENU(east, north, up) -> 内部世界坐标(east, up, north)
+    // 仅重排位置分量，不执行 raw SLAM 地理对齐；不能用于旋转矩阵/姿态。
     inline Eigen::Vector3f enuToInternal(float east, float north, float up)
     {
         return Eigen::Vector3f(east, up, north);
@@ -117,6 +124,18 @@ namespace android_slam
         Eigen::Vector3f m_t = Eigen::Vector3f::Zero();
         float m_sim_scale = 1.0f;
         bool m_aligned = false;
+
+        // Diagnostic output is separate from the existing trajectory log.
+        FILE* m_debug_file = nullptr;
+        int64_t m_last_input_timestamp = -1;
+        uint64_t m_debug_frame_index = 0;
+        void writeDebugLine(const std::string& line, bool flush);
+        std::future<void> m_debug_image_job;
+        cv::Mat m_debug_previous_image;
+        int64_t m_debug_previous_image_ts = 0;
+        int m_debug_loss_snapshots = 0;
+        int m_debug_weak_stage = 0;
+        std::string m_debug_frames_dir;
 
     };
 

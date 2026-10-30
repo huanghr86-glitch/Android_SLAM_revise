@@ -62,7 +62,9 @@ public:
     std::tuple<int,int> GetIndexInKeyFrame(KeyFrame* pKF);
     bool IsInKeyFrame(KeyFrame* pKF);
 
-    void SetBadFlag();
+    enum DebugInvalidation { DebugOther = 0, DebugErasedObservation = 1, DebugFusion = 2,
+                             DebugLowFoundRatio = 3, DebugAgeObservation = 4 };
+    void SetBadFlag(int diagnostic_reason = DebugOther);
     bool isBad();
 
     void Replace(MapPoint* pMP);    
@@ -99,6 +101,8 @@ public:
     static long unsigned int nNextId;
     long int mnFirstKFid;
     long int mnFirstFrame;
+    // Set before publication; immutable within these live diagnostic sessions.
+    double mDebugBirthTime = -1.0;
     int nObs;
 
     // Variables used by the tracking

@@ -18,6 +18,7 @@
 
 
 #include "threads/LoopClosing.h"
+#include "utils/CornerDiagnostics.h"
 #include <mutex>
 #include <thread>
 
@@ -318,6 +319,10 @@ void LoopClosing::InsertKeyFrame(KeyFrame *pKF)
     unique_lock<mutex> lock(mMutexLoopQueue);
     if(pKF->mnId!=0)
         mlpLoopKeyFrameQueue.push_back(pKF);
+    const size_t queue_size = mlpLoopKeyFrameQueue.size();
+    lock.unlock();
+    WriteCornerEvent("SlamKeyframes.txt", "SLAM_KF_QUEUE stage=loop_enqueue kf=%lu ts=%.9f queue=%zu latest_frame_s=%.9f",
+            pKF->mnId, pKF->mTimeStamp, queue_size, CornerFrameTime());
 }
 
 bool LoopClosing::CheckNewKeyFrames()
@@ -332,16 +337,21 @@ bool LoopClosing::NewDetectCommonRegions()
     if(!mbActiveLC)
         return false;
 
+    size_t debug_queue_size = 0;
     {
         unique_lock<mutex> lock(mMutexLoopQueue);
         mpCurrentKF = mlpLoopKeyFrameQueue.front();
         mlpLoopKeyFrameQueue.pop_front();
+        debug_queue_size = mlpLoopKeyFrameQueue.size();
         // Avoid that a keyframe can be erased while it is being process by this thread
         mpCurrentKF->SetNotErase();
         mpCurrentKF->mbCurrentPlaceRecognition = true;
 
         mpLastMap = mpCurrentKF->GetMap();
     }
+    WriteCornerEvent("SlamKeyframes.txt", "SLAM_KF_QUEUE stage=loop_dequeue kf=%lu ts=%.9f queue=%zu latest_frame_s=%.9f frame_lag_s=%.6f",
+            mpCurrentKF->mnId, mpCurrentKF->mTimeStamp, debug_queue_size, CornerFrameTime(),
+            CornerFrameTime() - mpCurrentKF->mTimeStamp);
 
     if(mpLastMap->IsInertial() && !mpLastMap->GetIniertialBA2())
     {

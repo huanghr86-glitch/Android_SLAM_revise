@@ -18,6 +18,8 @@
 
 
 #include "threads/LocalMapping.h"
+#include "utils/CornerDiagnostics.h"
+#include "utils/CornerGeometryDiagnostics.h"
 #include <mutex>
 #include <chrono>
 
@@ -359,6 +361,9 @@ void LocalMapping::ProcessNewKeyFrame()
 
     // Insert Keyframe in Map
     mpAtlas->AddKeyFrame(mpCurrentKeyFrame);
+    WriteCornerEvent("SlamKeyframes.txt", "SLAM_KF_QUEUE stage=local_processed kf=%lu ts=%.9f latest_frame_s=%.9f frame_lag_s=%.6f",
+            mpCurrentKeyFrame->mnId, mpCurrentKeyFrame->mTimeStamp, CornerFrameTime(),
+            CornerFrameTime() - mpCurrentKeyFrame->mTimeStamp);
 }
 
 void LocalMapping::EmptyQueue()
@@ -381,36 +386,117 @@ void LocalMapping::MapPointCulling()
     const int cnThObs = nThObs;
 
     int borrar = mlpRecentAddedMapPoints.size();
+    const int pool_before = borrar;
+    int already_bad = 0, ratio_removed = 0, obs_removed = 0, matured = 0, kept = 0;
+    int removed_le02 = 0, removed_le05 = 0, removed_le2 = 0, invalid_age = 0;
+    double ratio_age_sum = 0, obs_age_sum = 0;
+    const auto recordRemoval = [&](MapPoint* point, bool by_ratio) {
+        const double age = point->mDebugBirthTime < 0 ? -1 : mpCurrentKeyFrame->mTimeStamp - point->mDebugBirthTime;
+        if (age < 0) { ++invalid_age; return; }
+        if (by_ratio) ratio_age_sum += age;
+        else obs_age_sum += age;
+        if (age <= 0.2) ++removed_le02;
+        if (age <= 0.5) ++removed_le05;
+        if (age <= 2.0) ++removed_le2;
+    };
 
     while(lit!=mlpRecentAddedMapPoints.end())
     {
         MapPoint* pMP = *lit;
 
         if(pMP->isBad())
+        {
+            ++already_bad;
             lit = mlpRecentAddedMapPoints.erase(lit);
+        }
         else if(pMP->GetFoundRatio()<0.25f)
         {
-            pMP->SetBadFlag();
+            ++ratio_removed;
+            recordRemoval(pMP, true);
+            pMP->SetBadFlag(MapPoint::DebugLowFoundRatio);
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else if(((int)nCurrentKFid-(int)pMP->mnFirstKFid)>=2 && pMP->Observations()<=cnThObs)
         {
-            pMP->SetBadFlag();
+            ++obs_removed;
+            recordRemoval(pMP, false);
+            pMP->SetBadFlag(MapPoint::DebugAgeObservation);
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
         else if(((int)nCurrentKFid-(int)pMP->mnFirstKFid)>=3)
+        {
+            ++matured;
             lit = mlpRecentAddedMapPoints.erase(lit);
+        }
         else
         {
+            ++kept;
             lit++;
             borrar--;
         }
     }
+    WriteCornerEvent("SlamMapping.txt", "SLAM_CULL kf=%lu ts=%.9f pool=%d already_bad=%d ratio_removed=%d obs_removed=%d matured=%d kept=%d removed_le02s=%d removed_le05s=%d removed_le2s=%d invalid_age=%d ratio_age_sum_s=%.6f obs_age_sum_s=%.6f",
+            nCurrentKFid, mpCurrentKeyFrame->mTimeStamp, pool_before, already_bad, ratio_removed, obs_removed,
+            matured, kept, removed_le02, removed_le05, removed_le2, invalid_age, ratio_age_sum, obs_age_sum);
+    WriteCornerPointTotals(nCurrentKFid, mpCurrentKeyFrame->mTimeStamp);
 }
 
 
 void LocalMapping::CreateNewMapPoints()
 {
+    struct MappingReport : CornerTriangulationStatistics
+    {
+        unsigned long kf;
+        double ts;
+        int visited = 0, baseline_skipped = 0;
+        int neighbors = 0, interrupted = 0;
+        vector<string> neighbor_lines;
+        vector<string> matching_lines;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        MappingReport(unsigned long id, double timestamp) : kf(id), ts(timestamp) {}
+        ~MappingReport()
+        {
+            const auto io_started = std::chrono::steady_clock::now();
+            WriteCornerEvent("SlamMapping.txt",
+                    "SLAM_MAPPING kf=%lu ts=%.9f visited=%d baseline_skipped=%d triangulation_matches=%d created=%d mapping_ms=%.3f neighbors=%d interrupted=%d parallax_rejected=%d triangulation_failed=%d depth1_rejected=%d depth2_rejected=%d reproj1_rejected=%d reproj2_rejected=%d zero_distance=%d far_rejected=%d scale_rejected=%d",
+                    kf, ts, visited, baseline_skipped, triangulation_matches, created,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                    neighbors, interrupted, parallax_rejected, triangulation_failed, depth1_rejected, depth2_rejected,
+                    reproj1_rejected, reproj2_rejected, zero_distance, far_rejected, scale_rejected);
+            WriteCornerEvent("SlamMapping.txt", "SLAM_RAY_GEOMETRY kf=%lu ts=%.9f latest_frame_s=%.9f matches=%d parallax_rejected=%d ray_nonfinite=%d ray_out_of_range=%d ray_nonpositive=%d ray_low_parallax=%d ray_other=%d angle_lt05=%d angle_05_1=%d angle_1_2=%d angle_2_5=%d angle_ge5=%d angle_invalid=%d neighbor_records=%zu",
+                    kf, ts, CornerFrameTime(), triangulation_matches, parallax_rejected,
+                    ray_rejected[0], ray_rejected[1], ray_rejected[2], ray_rejected[3], ray_rejected[4],
+                    angle_bins[0], angle_bins[1], angle_bins[2], angle_bins[3], angle_bins[4], angle_bins[5], neighbor_lines.size());
+            WriteCornerEvents("SlamMapping.txt", neighbor_lines);
+            WriteCornerEvents("SlamMapping.txt", matching_lines);
+            const auto finished = std::chrono::steady_clock::now();
+            WriteCornerEvent("SlamMapping.txt", "SLAM_MAPPING_DIAG kf=%lu ts=%.9f neighbor_rows=%zu match_rows=%zu total_ms=%.3f log_ms=%.3f",
+                    kf, ts, neighbor_lines.size(), matching_lines.size(), std::chrono::duration<double, std::milli>(finished - start).count(),
+                    std::chrono::duration<double, std::milli>(finished - io_started).count());
+        }
+    } report{mpCurrentKeyFrame->mnId, mpCurrentKeyFrame->mTimeStamp};
+    struct NeighborReport : CornerTriangulationStatistics
+    {
+        MappingReport& parent;
+        unsigned long neighbor;
+        double neighbor_ts;
+        int shared_weight = 0, baseline_skipped = 0, ratio_valid = 0;
+        float baseline = -1, median_depth = -1, baseline_ratio = -1;
+        NeighborReport(MappingReport& report, KeyFrame* other) :
+                parent(report), neighbor(other->mnId), neighbor_ts(other->mTimeStamp) {}
+        ~NeighborReport()
+        {
+            parent.Add(*this);
+            AppendCornerEvent(parent.neighbor_lines, "SLAM_TRI_NEIGHBOR kf=%lu ts=%.9f neighbor=%lu neighbor_ts=%.9f age_s=%.6f shared_weight=%d baseline_slam=%.9g median_depth_slam=%.9g baseline_ratio=%.9g ratio_valid=%d baseline_skipped=%d matches=%d created=%d parallax_rejected=%d triangulation_failed=%d depth1_rejected=%d depth2_rejected=%d reproj1_rejected=%d reproj2_rejected=%d zero_distance=%d far_rejected=%d scale_rejected=%d ray_nonfinite=%d ray_out_of_range=%d ray_nonpositive=%d ray_low_parallax=%d ray_other=%d angle_lt05=%d angle_05_1=%d angle_1_2=%d angle_2_5=%d angle_ge5=%d angle_invalid=%d",
+                    parent.kf, parent.ts, neighbor, neighbor_ts, parent.ts - neighbor_ts, shared_weight,
+                    baseline, median_depth, baseline_ratio, ratio_valid, baseline_skipped,
+                    triangulation_matches, created, parallax_rejected, triangulation_failed,
+                    depth1_rejected, depth2_rejected, reproj1_rejected, reproj2_rejected, zero_distance,
+                    far_rejected, scale_rejected, ray_rejected[0], ray_rejected[1], ray_rejected[2],
+                    ray_rejected[3], ray_rejected[4], angle_bins[0], angle_bins[1], angle_bins[2],
+                    angle_bins[3], angle_bins[4], angle_bins[5]);
+        }
+    };
     // Retrieve neighbor keyframes in covisibility graph
     int nn = 10;
     // For stereo inertial case
@@ -432,6 +518,7 @@ void LocalMapping::CreateNewMapPoints()
     }
 
     float th = 0.6f;
+    report.neighbors = static_cast<int>(vpNeighKFs.size());
 
     ORBmatcher matcher(th,false);
 
@@ -458,9 +545,15 @@ void LocalMapping::CreateNewMapPoints()
     for(size_t i=0; i<vpNeighKFs.size(); i++)
     {
         if(i>0 && CheckNewKeyFrames())
+        {
+            report.interrupted = 1;
             return;
+        }
 
         KeyFrame* pKF2 = vpNeighKFs[i];
+        ++report.visited;
+        NeighborReport neighbor(report, pKF2);
+        neighbor.shared_weight = mpCurrentKeyFrame->GetWeight(pKF2);
 
         GeometricCamera* pCamera1 = mpCurrentKeyFrame->mpCamera, *pCamera2 = pKF2->mpCamera;
 
@@ -468,26 +561,49 @@ void LocalMapping::CreateNewMapPoints()
         Eigen::Vector3f Ow2 = pKF2->GetCameraCenter();
         Eigen::Vector3f vBaseline = Ow2-Ow1;
         const float baseline = vBaseline.norm();
+        neighbor.baseline = baseline;
 
         if(!mbMonocular)
         {
             if(baseline<pKF2->mb)
+            {
+                neighbor.baseline_skipped = 1;
                 continue;
+            }
         }
         else
         {
             const float medianDepthKF2 = pKF2->ComputeSceneMedianDepth(2);
             const float ratioBaselineDepth = baseline/medianDepthKF2;
+            neighbor.median_depth = medianDepthKF2;
+            neighbor.baseline_ratio = ratioBaselineDepth;
+            neighbor.ratio_valid = CornerFinite(medianDepthKF2) && medianDepthKF2 > 0 &&
+                    CornerFinite(baseline) && CornerFinite(ratioBaselineDepth);
 
             if(ratioBaselineDepth<0.01)
+            {
+                ++report.baseline_skipped;
+                neighbor.baseline_skipped = 1;
                 continue;
+            }
         }
 
         // Search matches that fullfil epipolar constraint
         vector<pair<size_t,size_t> > vMatchedIndices;
         bool bCoarse = mbInertial && mpTracker->mState==Tracking::RECENTLY_LOST && mpCurrentKeyFrame->GetMap()->GetIniertialBA2();
 
-        matcher.SearchForTriangulation(mpCurrentKeyFrame,pKF2,vMatchedIndices,false,bCoarse);
+        TriangulationMatchDiagnostics matching;
+        const bool trace_matching = mpCurrentKeyFrame->TrackedMapPoints(1) < 100;
+        const auto match_start = std::chrono::steady_clock::now();
+        matcher.SearchForTriangulation(mpCurrentKeyFrame,pKF2,vMatchedIndices,false,bCoarse,trace_matching ? &matching : nullptr);
+        if (trace_matching) AppendCornerEvent(report.matching_lines, "SLAM_TRI_MATCH kf=%lu ts=%.9f neighbor=%lu shared_nodes=%d source_slots=%d source_mapped=%d source_shared=%d source_mapped_shared=%d source_stereo=%d source_unmatched=%d source_matches=%d pairs=%d pair_used=%d pair_stereo=%d pair_descriptor=%d pair_epipole=%d pair_epipolar=%d pair_accepted=%d orientation=%d matched=%d target_unique=%d match_ms=%.3f",
+                mpCurrentKeyFrame->mnId, mpCurrentKeyFrame->mTimeStamp, pKF2->mnId, matching.shared_nodes,
+                matching.source_slots, matching.source_mapped, matching.source_shared, matching.source_mapped_shared,
+                matching.source_stereo, matching.source_unmatched, matching.source_matches, matching.pairs,
+                matching.pair_used, matching.pair_stereo, matching.pair_descriptor, matching.pair_epipole,
+                matching.pair_epipolar, matching.pair_accepted, matching.orientation, matching.matched,
+                matching.target_unique, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-match_start).count());
+        neighbor.triangulation_matches = static_cast<int>(vMatchedIndices.size());
 
         Sophus::SE3<float> sophTcw2 = pKF2->GetPose();
         Eigen::Matrix<float,3,4> eigTcw2 = sophTcw2.matrix3x4();
@@ -585,6 +701,7 @@ void LocalMapping::CreateNewMapPoints()
             Eigen::Vector3f ray1 = Rwc1 * xn1;
             Eigen::Vector3f ray2 = Rwc2 * xn2;
             const float cosParallaxRays = ray1.dot(ray2)/(ray1.norm() * ray2.norm());
+            ++neighbor.angle_bins[CornerRayAngleBin(cosParallaxRays)];
 
             float cosParallaxStereo = cosParallaxRays+1;
             float cosParallaxStereo1 = cosParallaxStereo;
@@ -608,7 +725,10 @@ void LocalMapping::CreateNewMapPoints()
             {
                 goodProj = GeometricTools::Triangulate(xn1, xn2, eigTcw1, eigTcw2, x3D);
                 if(!goodProj)
+                {
+                    ++neighbor.triangulation_failed;
                     continue;
+                }
             }
             else if(bStereo1 && cosParallaxStereo1<cosParallaxStereo2)
             {
@@ -624,6 +744,8 @@ void LocalMapping::CreateNewMapPoints()
             }
             else
             {
+                ++neighbor.parallax_rejected;
+                ++neighbor.ray_rejected[CornerRayRejection(cosParallaxRays, mbInertial)];
                 continue; //No stereo and very low parallax
             }
 
@@ -631,16 +753,25 @@ void LocalMapping::CreateNewMapPoints()
                 countStereoGoodProj++;
 
             if(!goodProj)
+            {
+                ++neighbor.triangulation_failed;
                 continue;
+            }
 
             //Check triangulation in front of cameras
             float z1 = Rcw1.row(2).dot(x3D) + tcw1(2);
             if(z1<=0)
+            {
+                ++neighbor.depth1_rejected;
                 continue;
+            }
 
             float z2 = Rcw2.row(2).dot(x3D) + tcw2(2);
             if(z2<=0)
+            {
+                ++neighbor.depth2_rejected;
                 continue;
+            }
 
             //Check reprojection error in first keyframe
             const float &sigmaSquare1 = mpCurrentKeyFrame->mvLevelSigma2[kp1.octave];
@@ -655,7 +786,10 @@ void LocalMapping::CreateNewMapPoints()
                 float errY1 = uv1.y - kp1.pt.y;
 
                 if((errX1*errX1+errY1*errY1)>5.991*sigmaSquare1)
+                {
+                    ++neighbor.reproj1_rejected;
                     continue;
+                }
 
             }
             else
@@ -667,7 +801,10 @@ void LocalMapping::CreateNewMapPoints()
                 float errY1 = v1 - kp1.pt.y;
                 float errX1_r = u1_r - kp1_ur;
                 if((errX1*errX1+errY1*errY1+errX1_r*errX1_r)>7.8*sigmaSquare1)
+                {
+                    ++neighbor.reproj1_rejected;
                     continue;
+                }
             }
 
             //Check reprojection error in second keyframe
@@ -681,7 +818,10 @@ void LocalMapping::CreateNewMapPoints()
                 float errX2 = uv2.x - kp2.pt.x;
                 float errY2 = uv2.y - kp2.pt.y;
                 if((errX2*errX2+errY2*errY2)>5.991*sigmaSquare2)
+                {
+                    ++neighbor.reproj2_rejected;
                     continue;
+                }
             }
             else
             {
@@ -692,7 +832,10 @@ void LocalMapping::CreateNewMapPoints()
                 float errY2 = v2 - kp2.pt.y;
                 float errX2_r = u2_r - kp2_ur;
                 if((errX2*errX2+errY2*errY2+errX2_r*errX2_r)>7.8*sigmaSquare2)
+                {
+                    ++neighbor.reproj2_rejected;
                     continue;
+                }
             }
 
             //Check scale consistency
@@ -703,16 +846,25 @@ void LocalMapping::CreateNewMapPoints()
             float dist2 = normal2.norm();
 
             if(dist1==0 || dist2==0)
+            {
+                ++neighbor.zero_distance;
                 continue;
+            }
 
             if(mbFarPoints && (dist1>=mThFarPoints||dist2>=mThFarPoints)) // MODIFICATION
+            {
+                ++neighbor.far_rejected;
                 continue;
+            }
 
             const float ratioDist = dist2/dist1;
             const float ratioOctave = mpCurrentKeyFrame->mvScaleFactors[kp1.octave]/pKF2->mvScaleFactors[kp2.octave];
 
             if(ratioDist*ratioFactor<ratioOctave || ratioDist>ratioOctave*ratioFactor)
+            {
+                ++neighbor.scale_rejected;
                 continue;
+            }
 
             // Triangulation is succesfull
             MapPoint* pMP = new MapPoint(x3D, mpCurrentKeyFrame, mpAtlas->GetCurrentMap());
@@ -731,6 +883,7 @@ void LocalMapping::CreateNewMapPoints()
 
             mpAtlas->AddMapPoint(pMP);
             mlpRecentAddedMapPoints.push_back(pMP);
+            ++neighbor.created;
         }
     }    
 }
@@ -1067,6 +1220,9 @@ void LocalMapping::KeyFrameCulling()
             }
             else
             {
+                WriteCornerEvent("SlamKeyframes.txt", "SLAM_KF_CULL action=request kf=%lu ts=%.9f current_kf=%lu current_ts=%.9f age_s=%.6f points=%d redundant=%d threshold=%.3f",
+                        pKF->mnId, pKF->mTimeStamp, mpCurrentKeyFrame->mnId, mpCurrentKeyFrame->mTimeStamp,
+                        mpCurrentKeyFrame->mTimeStamp - pKF->mTimeStamp, nMPs, nRedundantObservations, redundant_th);
                 pKF->SetBadFlag();
             }
         }

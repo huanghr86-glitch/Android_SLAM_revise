@@ -4,6 +4,9 @@
 #include <cassert>
 
 #include "utils/Log.h"
+#include "sensor/SensorGnss.h"
+#include <time.h>
+#include <cstdio>
 
 namespace android_slam
 {
@@ -92,6 +95,19 @@ namespace android_slam
                 if(facing == ACAMERA_LENS_FACING_BACK)
                 {
                     active_camera_id = id;
+                    ACameraMetadata_const_entry timestamp_source{};
+                    const auto timestamp_status = ACameraMetadata_getConstEntry(
+                            metadata.get(), ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE, &timestamp_source);
+                    const int source = timestamp_status == ACAMERA_OK && timestamp_source.count > 0
+                            ? timestamp_source.data.u8[0] : 0;
+                    timespec now{};
+                    clock_gettime(CLOCK_BOOTTIME, &now);
+                    SensorGnss::instance().setCameraTimestampSource(source,
+                            static_cast<int64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec);
+                    DEBUG_INFO("[Android Slam Camera Info] timestamp source=%d (1=boot clock, 0=unknown)", source);
+                    __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG",
+                            "SLAM_CAMERA_CONFIG id=%s width=%d height=%d timestamp_source=%d template=PREVIEW",
+                            id, width, height, source);
                     break;
                 }
             }
@@ -218,10 +234,50 @@ namespace android_slam
 
     void SensorCamera::startCapture()
     {
+        if (FILE* file = std::fopen("/storage/emulated/0/Documents/SlamCamera.txt", "w"))
+            std::fclose(file);
+        // Read capture results without changing AE, AF, frame rate, or OIS/EIS.
+        // Timestamps join these records to SLAM_FRAME.ts in the debug log.
+        m_capture_callbacks.onCaptureCompleted = [](void*, ACameraCaptureSession*,
+                ACaptureRequest*, const ACameraMetadata* result) {
+            const auto read = [result](uint32_t tag, int kind) -> double {
+                ACameraMetadata_const_entry entry{};
+                if (ACameraMetadata_getConstEntry(result, tag, &entry) != ACAMERA_OK || entry.count == 0)
+                    return -1.0;
+                switch (kind)
+                {
+                    case 0: return entry.data.u8[0];
+                    case 1: return entry.data.i32[0];
+                    case 2: return static_cast<double>(entry.data.i64[0]);
+                    default: return entry.data.f[0];
+                }
+            };
+            ACameraMetadata_const_entry timestamp_entry{};
+            const long long timestamp = ACameraMetadata_getConstEntry(result, ACAMERA_SENSOR_TIMESTAMP,
+                    &timestamp_entry) == ACAMERA_OK && timestamp_entry.count > 0 ? timestamp_entry.data.i64[0] : -1;
+            const double exposure = read(ACAMERA_SENSOR_EXPOSURE_TIME, 2);
+            const double skew = read(ACAMERA_SENSOR_ROLLING_SHUTTER_SKEW, 2);
+            const double duration = read(ACAMERA_SENSOR_FRAME_DURATION, 2);
+            char line[640];
+            std::snprintf(line, sizeof(line),
+                    "SLAM_CAMERA ts=%lld exposure_ms=%.3f frame_duration_ms=%.3f rolling_shutter_ms=%.3f iso=%.0f af=%.0f ae=%.0f focus_diopters=%.4f focal_mm=%.3f eis=%.0f ois=%.0f",
+                    timestamp, exposure < 0 ? -1.0 : exposure * 1e-6,
+                    duration < 0 ? -1.0 : duration * 1e-6, skew < 0 ? -1.0 : skew * 1e-6,
+                    read(ACAMERA_SENSOR_SENSITIVITY, 1), read(ACAMERA_CONTROL_AF_STATE, 0),
+                    read(ACAMERA_CONTROL_AE_STATE, 0), read(ACAMERA_LENS_FOCUS_DISTANCE, 3),
+                    read(ACAMERA_LENS_FOCAL_LENGTH, 3), read(ACAMERA_CONTROL_VIDEO_STABILIZATION_MODE, 0),
+                    read(ACAMERA_LENS_OPTICAL_STABILIZATION_MODE, 0));
+            __android_log_print(ANDROID_LOG_INFO, "SLAM_DIAG", "%s", line);
+            if (FILE* file = std::fopen("/storage/emulated/0/Documents/SlamCamera.txt", "a"))
+            {
+                std::fprintf(file, "%s\n", line);
+                std::fclose(file);
+            }
+        };
         std::vector<ACaptureRequest*> capture_request_list{ m_capture_request.release() };
         camera_status_t cs = ACameraCaptureSession_setRepeatingRequest(
                 m_capture_session.get(),
-                nullptr,
+                &m_capture_callbacks,
                 (int)capture_request_list.size(),
                 capture_request_list.data(),
                 nullptr

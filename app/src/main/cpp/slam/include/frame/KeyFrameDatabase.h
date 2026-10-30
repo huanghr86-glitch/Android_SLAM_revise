@@ -23,6 +23,7 @@
 #include <list>
 #include <set>
 #include <mutex>
+#include <unordered_map>
 
 #include "frame/Frame.h"
 #include "frame/KeyFrame.h"
@@ -54,6 +55,14 @@ public:
     void clear();
     void clearMap(Map* pMap);
 
+    struct DebugIndexStats
+    {
+        int map_kfs = 0, ref_present = 0, last_present = 0;
+        long newest_kf = -1;
+        double newest_ts = -1;
+    };
+    DebugIndexStats GetDebugIndexStats(long map_id, KeyFrame* reference, KeyFrame* last);
+
     // Loop Detection(DEPRECATED)
     std::vector<KeyFrame *> DetectLoopCandidates(KeyFrame* pKF, float minScore);
 
@@ -82,6 +91,8 @@ protected:
 
    // Mutex
    std::mutex mMutex;
+   struct DebugIndexEntry { long map_id; long kf; double ts; };
+   std::unordered_map<KeyFrame*, DebugIndexEntry> mDebugIndex;
 
 };
 

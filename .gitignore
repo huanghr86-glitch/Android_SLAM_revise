@@ -91,9 +91,11 @@ app/src/main/assets/vocabulary/ORBVoc.txt
 *.bak
 _apk_cmp/
 
-# --- local tools / data / docs (ignored) ---
-pc_data/
-pc_tools/
+# --- local tools / data (ignored) ---
+/pc_data/
+/pc_datas/
+/pc_tools/
+__pycache__/
 手动添加文件/
 编译指令.txt
 编译安装指令.txt

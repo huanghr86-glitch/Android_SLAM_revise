@@ -32,6 +32,16 @@
 
 namespace ORB_SLAM3
 {
+    struct TriangulationMatchDiagnostics;
+    struct ProjectionMatchDiagnostics;
+    struct RecoveryProjectionDiagnostics;
+    struct RecoveryProjectionPoint
+    {
+        MapPoint* point;
+        KeyFrame* source;
+        std::size_t feature_index;
+        int source_kind; // 0: original seed, 1: recent KF, 2: covisible KF
+    };
 
     class ORBmatcher
     {
@@ -44,7 +54,8 @@ namespace ORB_SLAM3
 
         // Search matches between Frame keypoints and projected MapPoints. Returns number of matches
         // Used to track the local map (Tracking)
-        int SearchByProjection(Frame &F, const std::vector<MapPoint*> &vpMapPoints, const float th=3, const bool bFarPoints = false, const float thFarPoints = 50.0f);
+        int SearchByProjection(Frame &F, const std::vector<MapPoint*> &vpMapPoints, const float th=3, const bool bFarPoints = false, const float thFarPoints = 50.0f,
+                               ProjectionMatchDiagnostics* diagnostic = nullptr);
 
         // Project MapPoints tracked in last frame into the current frame and search matches.
         // Used to track from previous frame (Tracking)
@@ -53,6 +64,11 @@ namespace ORB_SLAM3
         // Project MapPoints seen in KeyFrame into the Frame and search matches.
         // Used in relocalisation (Tracking)
         int SearchByProjection(Frame &CurrentFrame, KeyFrame* pKF, const std::set<MapPoint*> &sAlreadyFound, const float th, const int ORBdist);
+
+        // Additional unique points outside the original relocalization seed.
+        int SearchRecoveryPool(Frame& current, const std::vector<RecoveryProjectionPoint>& pool,
+                               const std::set<MapPoint*>& already_found, float th, int descriptor_limit,
+                               RecoveryProjectionDiagnostics& diagnostics);
 
         // Project MapPoints using a Similarity Transformation and search matches.
         // Used in loop detection (Loop Closing)
@@ -73,7 +89,8 @@ namespace ORB_SLAM3
 
         // Matching to triangulate new MapPoints. Check Epipolar Constraint.
         int SearchForTriangulation(KeyFrame *pKF1, KeyFrame* pKF2,
-                                   std::vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse = false);
+                                   std::vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse = false,
+                                   TriangulationMatchDiagnostics* diagnostic = nullptr);
 
         // Search matches between MapPoints seen in KF1 and KF2 transforming by a Sim3 [s12*R12|t12]
         // In the stereo and RGB-D case, s12=1

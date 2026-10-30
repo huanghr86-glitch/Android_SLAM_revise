@@ -49,6 +49,9 @@
 #include "solver/MLPnPsolver.h"
 
 #include <Eigen/Sparse>
+#include <unordered_set>
+#include <limits>
+#include "utils/RecoveryValidation.h"
 
 namespace ORB_SLAM3 {
     MLPnPsolver::MLPnPsolver(const Frame &F, const vector<MapPoint *> &vpMapPointMatches)
@@ -67,25 +70,32 @@ namespace ORB_SLAM3 {
         mvAllIndices.reserve(F.mvpMapPoints.size());
 
         int idx = 0;
+        std::unordered_set<unsigned long> unique_ids;
         for(size_t i = 0, iend = mvpMapPointMatches.size(); i < iend; i++){
             MapPoint* pMP = vpMapPointMatches[i];
 
             if(pMP){
                 if(!pMP -> isBad()){
-                    if(i >= F.mvKeysUn.size()) continue;
+                    if(i >= F.mvKeysUn.size()) { ++mDiagnostics.invalid_inputs; continue; }
                     const cv::KeyPoint &kp = F.mvKeysUn[i];
-
-                    mvP2D.push_back(kp.pt);
-                    mvSigma2.push_back(F.mvLevelSigma2[kp.octave]);
 
                     //Bearing vector should be normalized
                     cv::Point3f cv_br = mpCamera->unproject(kp.pt);
+                    //3D coordinates
+                    Eigen::Matrix<float,3,1> posEig = pMP -> GetWorldPos();
+                    if (kp.octave < 0 || kp.octave >= static_cast<int>(F.mvLevelSigma2.size()) ||
+                        !RecoveryFinite(kp.pt.x) || !RecoveryFinite(kp.pt.y) ||
+                        !RecoveryFinite(cv_br.x) || !RecoveryFinite(cv_br.y) || !RecoveryFinite(cv_br.z) ||
+                        cv_br.z <= 1e-6 || !RecoveryFinite(posEig(0)) || !RecoveryFinite(posEig(1)) ||
+                        !RecoveryFinite(posEig(2)) || !RecoveryFinite(F.mvLevelSigma2[kp.octave]) ||
+                        F.mvLevelSigma2[kp.octave] <= 0)
+                    { ++mDiagnostics.invalid_inputs; continue; }
+                    if (!unique_ids.insert(pMP->mnId).second) { ++mDiagnostics.duplicate_inputs; continue; }
                     cv_br /= cv_br.z;
                     bearingVector_t br(cv_br.x,cv_br.y,cv_br.z);
                     mvBearingVecs.push_back(br);
-
-                    //3D coordinates
-                    Eigen::Matrix<float,3,1> posEig = pMP -> GetWorldPos();
+                    mvP2D.push_back(kp.pt);
+                    mvSigma2.push_back(F.mvLevelSigma2[kp.octave]);
                     point_t pos(posEig(0),posEig(1),posEig(2));
                     mvP3Dw.push_back(pos);
 
@@ -106,20 +116,34 @@ namespace ORB_SLAM3 {
         bNoMore = false;
 	    vbInliers.clear();
 	    nInliers=0;
+        ++mDiagnostics.calls;
+        mDiagnostics.last_samples = 0;
+        mDiagnostics.reason = "batch";
 
-	    if(N<mRansacMinInliers)
+	    if(N<mRansacMinInliers || N<mRansacMinSet)
 	    {
 	        bNoMore = true;
+            mDiagnostics.exhausted = true;
+            mDiagnostics.reason = "insufficient_inputs";
 	        return false;
 	    }
+        if (mnIterations >= mRansacMaxIts)
+        {
+            bNoMore = true;
+            mDiagnostics.exhausted = true;
+            mDiagnostics.reason = "exhausted_entry";
+            return false;
+        }
 
 	    vector<size_t> vAvailableIndices;
 
 	    int nCurrentIterations = 0;
-	    while(mnIterations<mRansacMaxIts || nCurrentIterations<nIterations)
+	    while(PnPCanSample(mnIterations, mRansacMaxIts, nCurrentIterations, nIterations))
 	    {
 	        nCurrentIterations++;
 	        mnIterations++;
+            mDiagnostics.samples = mnIterations;
+            mDiagnostics.last_samples = nCurrentIterations;
 
 	        vAvailableIndices = mvAllIndices;
 
@@ -148,24 +172,12 @@ namespace ORB_SLAM3 {
 
             //Result
             transformation_t result;
+            result.setConstant(std::numeric_limits<double>::quiet_NaN());
 
 	        // Compute camera pose
             computePose(bearingVecs,p3DS,covs,indexes,result);
 
-            //Save result
-            mRi[0][0] = result(0,0);
-            mRi[0][1] = result(0,1);
-            mRi[0][2] = result(0,2);
-
-            mRi[1][0] = result(1,0);
-            mRi[1][1] = result(1,1);
-            mRi[1][2] = result(1,2);
-
-            mRi[2][0] = result(2,0);
-            mRi[2][1] = result(2,1);
-            mRi[2][2] = result(2,2);
-
-            mti[0] = result(0,3);mti[1] = result(1,3);mti[2] = result(2,3);
+            if (!ApplyPnPResult(result, mRi, mti)) { ++mDiagnostics.invalid_poses; continue; }
 
 	        // Check inliers
 	        CheckInliers();
@@ -178,16 +190,12 @@ namespace ORB_SLAM3 {
 	                mvbBestInliers = mvbInliersi;
 	                mnBestInliers = mnInliersi;
 
-	                cv::Mat Rcw(3,3,CV_64F,mRi);
-	                cv::Mat tcw(3,1,CV_64F,mti);
-	                Rcw.convertTo(Rcw,CV_32F);
-	                tcw.convertTo(tcw,CV_32F);
                     mBestTcw.setIdentity();
-                    mBestTcw.block<3,3>(0,0) = Converter::toMatrix3f(Rcw);
-                    mBestTcw.block<3,1>(0,3) = Converter::toVector3f(tcw);
-
-                    Eigen::Matrix<double, 3, 3, Eigen::RowMajor> eigRcw(mRi[0]);
-                    Eigen::Vector3d eigtcw(mti);
+                    for (int row = 0; row < 3; ++row)
+                    {
+                        for (int col = 0; col < 3; ++col) mBestTcw(row,col) = mRi[row][col];
+                        mBestTcw(row,3) = mti[row];
+                    }
 	            }
 
 	            if(Refine())
@@ -200,6 +208,9 @@ namespace ORB_SLAM3 {
 	                        vbInliers[mvKeyPointIndices[i]] = true;
 	                }
 	                Tout = mRefinedTcw;
+                    bNoMore = mnIterations >= mRansacMaxIts;
+                    mDiagnostics.exhausted = bNoMore;
+                    mDiagnostics.reason = "refined";
 	                return true;
 	            }
 
@@ -209,6 +220,8 @@ namespace ORB_SLAM3 {
 	    if(mnIterations>=mRansacMaxIts)
 	    {
 	        bNoMore=true;
+            mDiagnostics.exhausted = true;
+            mDiagnostics.reason = "exhausted_no_pose";
 	        if(mnBestInliers>=mRansacMinInliers)
 	        {
 	            nInliers=mnBestInliers;
@@ -219,6 +232,7 @@ namespace ORB_SLAM3 {
 	                    vbInliers[mvKeyPointIndices[i]] = true;
 	            }
 	            Tout = mBestTcw;
+                mDiagnostics.reason = "exhausted_best";
 	            return true;
 	        }
 	    }
@@ -234,6 +248,12 @@ namespace ORB_SLAM3 {
 	    mRansacMinSet = minSet;
 
 	    N = mvP2D.size(); // number of correspondences
+        mnIterations = 0;
+        mnBestInliers = 0;
+        mvbBestInliers.clear();
+        mDiagnostics.inputs = N;
+        mDiagnostics.calls = mDiagnostics.samples = mDiagnostics.last_samples = 0;
+        mDiagnostics.exhausted = false;
 
 	    mvbInliersi.resize(N);
 
@@ -245,18 +265,13 @@ namespace ORB_SLAM3 {
 	        nMinInliers=minSet;
 	    mRansacMinInliers = nMinInliers;
 
-	    if(mRansacEpsilon<(float)mRansacMinInliers/N)
+	    if(N > 0 && mRansacEpsilon<(float)mRansacMinInliers/N)
 	        mRansacEpsilon=(float)mRansacMinInliers/N;
 
 	    // Set RANSAC iterations according to probability, epsilon, and max iterations
-	    int nIterations;
-
-	    if(mRansacMinInliers==N)
-	        nIterations=1;
-	    else
-	        nIterations = ceil(log(1-mRansacProb)/log(1-pow(mRansacEpsilon,3)));
-
-	    mRansacMaxIts = max(1,min(nIterations,mRansacMaxIts));
+        // Each sample contains six points, not three.
+        mRansacMaxIts = PnPRequiredIterations(mRansacProb, mRansacEpsilon, mRansacMinSet, maxIterations);
+        mDiagnostics.limit = mRansacMaxIts;
 
 	    mvMaxError.resize(mvSigma2.size());
 	    for(size_t i=0; i<mvSigma2.size(); i++)
@@ -275,6 +290,8 @@ namespace ORB_SLAM3 {
             float xc = mRi[0][0]*P3Dw.x+mRi[0][1]*P3Dw.y+mRi[0][2]*P3Dw.z+mti[0];
             float yc = mRi[1][0]*P3Dw.x+mRi[1][1]*P3Dw.y+mRi[1][2]*P3Dw.z+mti[1];
             float zc = mRi[2][0]*P3Dw.x+mRi[2][1]*P3Dw.y+mRi[2][2]*P3Dw.z+mti[2];
+            if (!RecoveryFinite(xc) || !RecoveryFinite(yc) || !RecoveryFinite(zc) || zc <= 1e-6)
+            { mvbInliersi[i] = false; ++mDiagnostics.depth_rejected; continue; }
 
             cv::Point3f P3Dc(xc,yc,zc);
             cv::Point2f uv = mpCamera->project(P3Dc);
@@ -284,7 +301,7 @@ namespace ORB_SLAM3 {
 
             float error2 = distX*distX+distY*distY;
 
-            if(error2<mvMaxError[i])
+            if(RecoveryFinite(error2) && error2<mvMaxError[i])
             {
                 mvbInliersi[i]=true;
                 mnInliersi++;
@@ -297,6 +314,7 @@ namespace ORB_SLAM3 {
     }
 
     bool MLPnPsolver::Refine(){
+        ++mDiagnostics.refine_calls;
         vector<int> vIndices;
         vIndices.reserve(mvbBestInliers.size());
 
@@ -327,9 +345,12 @@ namespace ORB_SLAM3 {
 
         //Result
         transformation_t result;
+        result.setConstant(std::numeric_limits<double>::quiet_NaN());
 
         // Compute camera pose
         computePose(bearingVecs,p3DS,covs,indexes,result);
+
+        if (!ApplyPnPResult(result, mRi, mti)) { ++mDiagnostics.invalid_poses; return false; }
 
         // Check inliers
         CheckInliers();
@@ -339,18 +360,14 @@ namespace ORB_SLAM3 {
 
         if(mnInliersi>mRansacMinInliers)
         {
-            cv::Mat Rcw(3,3,CV_64F,mRi);
-            cv::Mat tcw(3,1,CV_64F,mti);
-            Rcw.convertTo(Rcw,CV_32F);
-            tcw.convertTo(tcw,CV_32F);
             mRefinedTcw.setIdentity();
+            for (int row = 0; row < 3; ++row)
+            {
+                for (int col = 0; col < 3; ++col) mRefinedTcw(row,col) = mRi[row][col];
+                mRefinedTcw(row,3) = mti[row];
+            }
 
-            mRefinedTcw.block<3,3>(0,0) = Converter::toMatrix3f(Rcw);
-            mRefinedTcw.block<3,1>(0,3) = Converter::toVector3f(tcw);
-
-            Eigen::Matrix<double, 3, 3, Eigen::RowMajor> eigRcw(mRi[0]);
-            Eigen::Vector3d eigtcw(mti);
-
+            ++mDiagnostics.refined;
             return true;
         }
         return false;

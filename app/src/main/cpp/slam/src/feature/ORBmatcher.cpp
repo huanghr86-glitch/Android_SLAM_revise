@@ -18,6 +18,8 @@
 
 
 #include "feature/ORBmatcher.h"
+#include "utils/CornerDiagnostics.h"
+#include "utils/CornerGeometryDiagnostics.h"
 #include <climits>
 
 #include <opencv2/core/core.hpp>
@@ -37,7 +39,7 @@ namespace ORB_SLAM3
     {
     }
 
-    int ORBmatcher::SearchByProjection(Frame &F, const vector<MapPoint*> &vpMapPoints, const float th, const bool bFarPoints, const float thFarPoints)
+    int ORBmatcher::SearchByProjection(Frame &F, const vector<MapPoint*> &vpMapPoints, const float th, const bool bFarPoints, const float thFarPoints, ProjectionMatchDiagnostics* diagnostic)
     {
         int nmatches=0, left = 0, right = 0;
 
@@ -57,6 +59,7 @@ namespace ORB_SLAM3
 
             if(pMP->mbTrackInView)
             {
+                if (diagnostic) ++diagnostic->attempted;
                 const int &nPredictedLevel = pMP->mnTrackScaleLevel;
 
                 // The size of the window will depend on the viewing direction
@@ -68,6 +71,7 @@ namespace ORB_SLAM3
                 const vector<size_t> vIndices =
                         F.GetFeaturesInArea(pMP->mTrackProjX,pMP->mTrackProjY,r*F.mvScaleFactors[nPredictedLevel],nPredictedLevel-1,nPredictedLevel);
 
+                if (vIndices.empty() && diagnostic) ++diagnostic->no_features;
                 if(!vIndices.empty()){
                     const cv::Mat MPdescriptor = pMP->GetDescriptor();
 
@@ -76,6 +80,7 @@ namespace ORB_SLAM3
                     int bestDist2=256;
                     int bestLevel2 = -1;
                     int bestIdx =-1 ;
+                    int compared = 0;
 
                     // Get best and second matches with near keypoints
                     for(vector<size_t>::const_iterator vit=vIndices.begin(), vend=vIndices.end(); vit!=vend; vit++)
@@ -95,6 +100,7 @@ namespace ORB_SLAM3
 
                         const cv::Mat &d = F.mDescriptors.row(idx);
 
+                        ++compared;
                         const int dist = DescriptorDistance(MPdescriptor,d);
 
                         if(dist<bestDist)
@@ -117,13 +123,22 @@ namespace ORB_SLAM3
                     }
 
                     // Apply ratio to second match (only if best and second are in the same scale level)
+                    if (diagnostic)
+                    {
+                        if (compared == 0) ++diagnostic->no_free_features;
+                        else if (bestDist > TH_HIGH) ++diagnostic->descriptor_rejected;
+                    }
                     if(bestDist<=TH_HIGH)
                     {
                         if(bestLevel==bestLevel2 && bestDist>mfNNratio*bestDist2)
+                        {
+                            if (diagnostic) ++diagnostic->ratio_rejected;
                             continue;
+                        }
 
                         if(bestLevel!=bestLevel2 || bestDist<=mfNNratio*bestDist2){
                             F.mvpMapPoints[bestIdx]=pMP;
+                            if (diagnostic) ++diagnostic->matched;
 
                             if(F.Nleft != -1 && F.mvLeftToRightMatch[bestIdx] != -1){ //Also match with the stereo observation at right camera
                                 F.mvpMapPoints[F.mvLeftToRightMatch[bestIdx] + F.Nleft] = pMP;
@@ -902,8 +917,14 @@ namespace ORB_SLAM3
     }
 
     int ORBmatcher::SearchForTriangulation(KeyFrame *pKF1, KeyFrame *pKF2,
-                                           vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse)
+                                           vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse,
+                                           TriangulationMatchDiagnostics* diagnostic)
     {
+        TriangulationMatchDiagnostics counters;
+        auto& d = diagnostic ? *diagnostic : counters;
+        d.source_slots = pKF1->N;
+        if (diagnostic)
+            for (MapPoint* point : pKF1->GetMapPointMatches()) if (point) ++d.source_mapped;
         const DBoW2::FeatureVector &vFeatVec1 = pKF1->mFeatVec;
         const DBoW2::FeatureVector &vFeatVec2 = pKF2->mFeatVec;
 
@@ -961,8 +982,10 @@ namespace ORB_SLAM3
         {
             if(f1it->first == f2it->first)
             {
+                ++d.shared_nodes;
                 for(size_t i1=0, iend1=f1it->second.size(); i1<iend1; i1++)
                 {
+                    ++d.source_shared;
                     const size_t idx1 = f1it->second[i1];
 
                     MapPoint* pMP1 = pKF1->GetMapPoint(idx1);
@@ -970,6 +993,7 @@ namespace ORB_SLAM3
                     // If there is already a MapPoint skip
                     if(pMP1)
                     {
+                        ++d.source_mapped_shared;
                         continue;
                     }
 
@@ -977,7 +1001,7 @@ namespace ORB_SLAM3
 
                     if(bOnlyStereo)
                         if(!bStereo1)
-                            continue;
+                        { ++d.source_stereo; continue; }
 
                     const cv::KeyPoint &kp1 = (pKF1 -> NLeft == -1) ? pKF1->mvKeysUn[idx1]
                                                                     : (idx1 < pKF1 -> NLeft) ? pKF1 -> mvKeys[idx1]
@@ -993,26 +1017,27 @@ namespace ORB_SLAM3
 
                     for(size_t i2=0, iend2=f2it->second.size(); i2<iend2; i2++)
                     {
+                        ++d.pairs;
                         size_t idx2 = f2it->second[i2];
 
                         MapPoint* pMP2 = pKF2->GetMapPoint(idx2);
 
                         // If we have already matched or there is a MapPoint skip
                         if(vbMatched2[idx2] || pMP2)
-                            continue;
+                        { ++d.pair_used; continue; }
 
                         const bool bStereo2 = (!pKF2->mpCamera2 &&  pKF2->mvuRight[idx2]>=0);
 
                         if(bOnlyStereo)
                             if(!bStereo2)
-                                continue;
+                            { ++d.pair_stereo; continue; }
 
                         const cv::Mat &d2 = pKF2->mDescriptors.row(idx2);
 
                         const int dist = DescriptorDistance(d1,d2);
 
                         if(dist>TH_LOW || dist>bestDist)
-                            continue;
+                        { ++d.pair_descriptor; continue; }
 
                         const cv::KeyPoint &kp2 = (pKF2 -> NLeft == -1) ? pKF2->mvKeysUn[idx2]
                                                                         : (idx2 < pKF2 -> NLeft) ? pKF2 -> mvKeys[idx2]
@@ -1026,6 +1051,7 @@ namespace ORB_SLAM3
                             const float distey = ep(1)-kp2.pt.y;
                             if(distex*distex+distey*distey<100*pKF2->mvScaleFactors[kp2.octave])
                             {
+                                ++d.pair_epipole;
                                 continue;
                             }
                         }
@@ -1068,13 +1094,16 @@ namespace ORB_SLAM3
 
                         if(bCoarse || pCamera1->epipolarConstrain(pCamera2,kp1,kp2,R12,t12,pKF1->mvLevelSigma2[kp1.octave],pKF2->mvLevelSigma2[kp2.octave])) // MODIFICATION_2
                         {
+                            ++d.pair_accepted;
                             bestIdx2 = idx2;
                             bestDist = dist;
                         }
+                        else ++d.pair_epipolar;
                     }
 
                     if(bestIdx2>=0)
                     {
+                        ++d.source_matches;
                         const cv::KeyPoint &kp2 = (pKF2 -> NLeft == -1) ? pKF2->mvKeysUn[bestIdx2]
                                                                         : (bestIdx2 < pKF2 -> NLeft) ? pKF2 -> mvKeys[bestIdx2]
                                                                                                      : pKF2 -> mvKeysRight[bestIdx2 - pKF2 -> NLeft];
@@ -1093,6 +1122,7 @@ namespace ORB_SLAM3
                             rotHist[bin].push_back(idx1);
                         }
                     }
+                    else ++d.source_unmatched;
                 }
 
                 f1it++;
@@ -1124,6 +1154,7 @@ namespace ORB_SLAM3
                 {
                     vMatches12[rotHist[i][j]]=-1;
                     nmatches--;
+                    ++d.orientation;
                 }
             }
 
@@ -1132,12 +1163,16 @@ namespace ORB_SLAM3
         vMatchedPairs.clear();
         vMatchedPairs.reserve(nmatches);
 
+        std::set<size_t> target_ids;
         for(size_t i=0, iend=vMatches12.size(); i<iend; i++)
         {
             if(vMatches12[i]<0)
                 continue;
             vMatchedPairs.push_back(make_pair(i,vMatches12[i]));
+            target_ids.insert(vMatches12[i]);
         }
+        d.matched = nmatches;
+        d.target_unique = static_cast<int>(target_ids.size());
 
         return nmatches;
     }
@@ -2004,6 +2039,86 @@ namespace ORB_SLAM3
         }
 
         return nmatches;
+    }
+
+    int ORBmatcher::SearchRecoveryPool(Frame& current, const vector<RecoveryProjectionPoint>& pool,
+            const set<MapPoint*>& already_found, float th, int descriptor_limit,
+            RecoveryProjectionDiagnostics& d)
+    {
+        const Sophus::SE3f pose = current.GetPose();
+        const Eigen::Vector3f center = pose.inverse().translation();
+        map<KeyFrame*, vector<vector<int>>> rotation_histograms;
+        for (const auto& entry : pool)
+        {
+            ++d.tested;
+            if (entry.source_kind == 0) { ++d.seed_excluded; continue; }
+            MapPoint* point = entry.point;
+            if (!point || point->isBad() || point->Observations() < 1 || !entry.source ||
+                entry.source->isBad() || entry.feature_index >= entry.source->mvKeysUn.size())
+            { ++d.invalid; continue; }
+            if (already_found.count(point)) { ++d.already_found; continue; }
+            const Eigen::Vector3f world = point->GetWorldPos();
+            const Eigen::Vector3f camera = pose * world;
+            if (!CornerFinite(camera.x()) || !CornerFinite(camera.y()) || !CornerFinite(camera.z()))
+            { ++d.invalid; continue; }
+            if (camera.z() <= 0) { ++d.depth; continue; }
+            const Eigen::Vector2f pixel = current.mpCamera->project(camera);
+            if (!CornerFinite(pixel.x()) || !CornerFinite(pixel.y())) { ++d.invalid; continue; }
+            if (pixel.x() < current.mnMinX || pixel.x() > current.mnMaxX ||
+                pixel.y() < current.mnMinY || pixel.y() > current.mnMaxY)
+            { ++d.bounds; continue; }
+            const float distance = (world - center).norm();
+            const float minimum = point->GetMinDistanceInvariance();
+            const float maximum = point->GetMaxDistanceInvariance();
+            if (!CornerFinite(distance) || distance <= 0 || !CornerFinite(minimum) || !CornerFinite(maximum))
+            { ++d.invalid; continue; }
+            if (distance < minimum || distance > maximum) { ++d.distance; continue; }
+            const int level = point->PredictScale(distance, &current);
+            if (level < 0 || level >= static_cast<int>(current.mvScaleFactors.size())) { ++d.invalid; continue; }
+            const float radius = th * current.mvScaleFactors[level];
+            const auto indices = current.GetFeaturesInArea(pixel.x(), pixel.y(), radius, level - 1, level + 1);
+            if (indices.empty()) { ++d.no_features; continue; }
+            const cv::Mat descriptor = point->GetDescriptor();
+            if (descriptor.empty()) { ++d.invalid; continue; }
+            int best_distance = 256, best_index = -1, compared = 0;
+            for (size_t index : indices)
+            {
+                if (current.mvpMapPoints[index]) continue;
+                ++compared;
+                const int value = DescriptorDistance(descriptor, current.mDescriptors.row(index));
+                if (value < best_distance) { best_distance = value; best_index = static_cast<int>(index); }
+            }
+            if (!compared) { ++d.no_free; continue; }
+            if (best_index < 0 || best_distance > descriptor_limit) { ++d.descriptor; continue; }
+            current.mvpMapPoints[best_index] = point;
+            ++d.matched;
+            if (mbCheckOrientation)
+            {
+                float rotation = entry.source->mvKeysUn[entry.feature_index].angle - current.mvKeysUn[best_index].angle;
+                if (rotation < 0) rotation += 360.0f;
+                int bin = round(rotation * (1.0f / HISTO_LENGTH));
+                if (bin == HISTO_LENGTH) bin = 0;
+                assert(bin >= 0 && bin < HISTO_LENGTH);
+                auto& histogram = rotation_histograms[entry.source];
+                if (histogram.empty()) histogram.resize(HISTO_LENGTH);
+                histogram[bin].push_back(best_index);
+            }
+        }
+        // Rotation differences are relative to each source KF, not a mixed view.
+        for (auto& item : rotation_histograms)
+        {
+            int first = -1, second = -1, third = -1;
+            ComputeThreeMaxima(item.second.data(), HISTO_LENGTH, first, second, third);
+            for (int bin = 0; bin < HISTO_LENGTH; ++bin)
+                if (bin != first && bin != second && bin != third)
+                    for (int index : item.second[bin])
+                    {
+                        current.mvpMapPoints[index] = nullptr;
+                        --d.matched;
+                        ++d.orientation;
+                    }
+        }
+        return d.matched;
     }
 
     void ORBmatcher::ComputeThreeMaxima(vector<int>* histo, const int L, int &ind1, int &ind2, int &ind3)
